@@ -1,7 +1,7 @@
 mod tls;
 
 use crate::{
-    config::ClientConfig,
+    config::PeerConfig,
     tunnel::{OpenTunnel, Tunnel},
 };
 use anytls_protocol::{
@@ -85,7 +85,7 @@ pub struct Connector {
 }
 
 impl Connector {
-    pub fn new(config: &ClientConfig) -> io::Result<Self> {
+    pub fn new(config: &PeerConfig) -> io::Result<Self> {
         config.validate()?;
         let anytls = config.anytls.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "anytls.password is required")

@@ -39,6 +39,20 @@ pub struct ReverseProxyConfig {
 pub struct ClientConfig {
     pub socks5_listen: SocketAddr,
     pub http_listen: SocketAddr,
+    #[serde(flatten)]
+    pub peer: PeerConfig,
+
+    #[serde(default)]
+    pub reverse_proxy: Vec<ReverseProxyConfig>,
+
+    #[cfg(target_os = "macos")]
+    #[serde(default)]
+    pub macos_logging: MacOsLogging,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerConfig {
     pub server_addr: SocketAddr,
     pub server_name: String,
     pub server_cert: PathBuf,
@@ -48,32 +62,31 @@ pub struct ClientConfig {
     pub anytls: Option<ClientAnyTlsConfig>,
 
     #[serde(default)]
-    pub reverse_proxy: Vec<ReverseProxyConfig>,
-
-    #[serde(default)]
     pub quic: QuicConfig,
-
-    #[cfg(target_os = "macos")]
-    #[serde(default)]
-    pub macos_logging: MacOsLogging,
 }
 
-impl ClientConfig {
+impl PeerConfig {
     pub fn validate(&self) -> io::Result<()> {
         validate_non_empty(&self.server_name, "server_name")?;
         if matches!(self.tunnel_type, TunnelType::Quinn | TunnelType::S2nQuic) {
             validate_quic(&self.quic)?;
         }
-
         if self.tunnel_type == TunnelType::AnyTls {
             let anytls = self
                 .anytls
                 .as_ref()
                 .ok_or_else(|| invalid_config("anytls.password is required"))?;
             validate_non_empty(&anytls.password, "anytls.password")?;
-            if !self.reverse_proxy.is_empty() {
-                return Err(invalid_config("anytls does not support reverse_proxy"));
-            }
+        }
+        Ok(())
+    }
+}
+
+impl ClientConfig {
+    pub fn validate(&self) -> io::Result<()> {
+        self.peer.validate()?;
+        if self.peer.tunnel_type == TunnelType::AnyTls && !self.reverse_proxy.is_empty() {
+            return Err(invalid_config("anytls does not support reverse_proxy"));
         }
 
         #[cfg(target_os = "macos")]
@@ -243,21 +256,24 @@ mod tests {
         let config = ClientConfig {
             socks5_listen: "127.0.0.1:1080".parse().unwrap(),
             http_listen: "127.0.0.1:8080".parse().unwrap(),
-            server_addr: "127.0.0.1:12345".parse().unwrap(),
-            server_name: "stunnel".to_string(),
-            server_cert: PathBuf::new(),
-            private_key: PathBuf::new(),
-            tunnel_type: TunnelType::TlsTcp,
-            anytls: None,
+            peer: crate::config::PeerConfig {
+                server_addr: "127.0.0.1:12345".parse().unwrap(),
+                server_name: "stunnel".to_string(),
+                server_cert: PathBuf::new(),
+                private_key: PathBuf::new(),
+                tunnel_type: TunnelType::TlsTcp,
+                anytls: None,
+                quic: QuicConfig {
+                    cc: CongestionControl::Fixed,
+                    loss_threshold: 0,
+                    fixed_bandwidth: 0,
+                },
+            },
             reverse_proxy: vec![ReverseProxyConfig {
                 listen: "127.0.0.1:8081".parse().unwrap(),
                 target: "127.0.0.1:3000".parse().unwrap(),
             }],
-            quic: QuicConfig {
-                cc: CongestionControl::Fixed,
-                loss_threshold: 0,
-                fixed_bandwidth: 0,
-            },
+
             #[cfg(target_os = "macos")]
             macos_logging: MacOsLogging::default(),
         };

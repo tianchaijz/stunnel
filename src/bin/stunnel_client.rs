@@ -13,10 +13,10 @@ async fn tlstcp_client(
     socks5_listener: TcpListener,
 ) -> std::io::Result<()> {
     let tlstcp_config = tlstcp::client::Config {
-        server_addr: config.server_addr,
-        server_name: config.server_name,
-        cert: config.server_cert,
-        priv_key: config.private_key,
+        server_addr: config.peer.server_addr,
+        server_name: config.peer.server_name,
+        cert: config.peer.server_cert,
+        priv_key: config.peer.private_key,
     };
 
     let connector = tlstcp::client::new(&tlstcp_config)?;
@@ -31,7 +31,7 @@ async fn anytls_client(
     http_listener: TcpListener,
     socks5_listener: TcpListener,
 ) -> std::io::Result<()> {
-    let connector = stunnel::anytls::Connector::new(&config)?;
+    let connector = stunnel::anytls::Connector::new(&config.peer)?;
     futures::try_join!(
         proxy::accept_http_tunnels(&http_listener, &connector, "anytls"),
         proxy::accept_socks5_tunnels(&socks5_listener, &connector, "anytls"),
@@ -47,15 +47,15 @@ async fn quinn_client(
     let reverse_tunnels = build_reverse_tunnels(&config.reverse_proxy);
     let client_config = quic::Config {
         addr: "0.0.0.0:0".parse().unwrap(),
-        cert: config.server_cert,
-        priv_key: config.private_key,
-        transport: config.quic,
+        cert: config.peer.server_cert,
+        priv_key: config.peer.private_key,
+        transport: config.peer.quic,
     };
 
     loop {
         let endpoint = quic::quinn::client::new(&client_config)?;
         let conn = endpoint
-            .connect(config.server_addr, &config.server_name)
+            .connect(config.peer.server_addr, &config.peer.server_name)
             .map_err(std::io::Error::other)?;
 
         match conn.await {
@@ -90,16 +90,16 @@ async fn s2n_client(
     let reverse_tunnels = build_reverse_tunnels(&config.reverse_proxy);
     let client_config = quic::Config {
         addr: "0.0.0.0:0".parse().unwrap(),
-        cert: config.server_cert,
-        priv_key: config.private_key,
-        transport: config.quic,
+        cert: config.peer.server_cert,
+        priv_key: config.peer.private_key,
+        transport: config.peer.quic,
     };
 
     let endpoint = quic::s2n_quic::client::new(&client_config)?;
 
     loop {
-        let connect = s2n_quic::client::Connect::new(config.server_addr)
-            .with_server_name(config.server_name.clone());
+        let connect = s2n_quic::client::Connect::new(config.peer.server_addr)
+            .with_server_name(config.peer.server_name.clone());
 
         match endpoint.connect(connect).await {
             Ok(mut conn) => {
@@ -198,7 +198,7 @@ async fn main() {
     init_log(&config);
     info!("starting up");
 
-    let result = match config.tunnel_type {
+    let result = match config.peer.tunnel_type {
         TunnelType::AnyTls => anytls_client(config, http_listener, socks5_listener).await,
         TunnelType::TlsTcp => tlstcp_client(config, http_listener, socks5_listener).await,
         TunnelType::Quinn => quinn_client(config, http_listener, socks5_listener).await,

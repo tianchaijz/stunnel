@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::ServerConfig;
+use crate::config::{ClientConfig, ServerConfig};
 use crate::tunnel::{
     AsyncReadDatagramExt, AsyncWriteDatagramExt,
     client::{connect_tcp_tunnel, connect_udp_tunnel},
@@ -54,16 +54,19 @@ impl Fixture {
         let config = ClientConfig {
             socks5_listen: "127.0.0.1:0".parse().unwrap(),
             http_listen: "127.0.0.1:0".parse().unwrap(),
-            server_addr: listener.local_addr().unwrap(),
-            server_name: "localhost".into(),
-            server_cert: cert_path,
-            private_key: key_path,
-            tunnel_type: crate::config::TunnelType::AnyTls,
-            anytls: Some(crate::config::ClientAnyTlsConfig {
-                password: "test-secret".into(),
-            }),
+            peer: crate::config::PeerConfig {
+                server_addr: listener.local_addr().unwrap(),
+                server_name: "localhost".into(),
+                server_cert: cert_path,
+                private_key: key_path,
+                tunnel_type: crate::config::TunnelType::AnyTls,
+                anytls: Some(crate::config::ClientAnyTlsConfig {
+                    password: "test-secret".into(),
+                }),
+                quic: Default::default(),
+            },
             reverse_proxy: vec![],
-            quic: Default::default(),
+
             #[cfg(target_os = "macos")]
             macos_logging: Default::default(),
         };
@@ -92,7 +95,7 @@ impl Fixture {
     }
 
     fn connector(&self) -> Connector {
-        Connector::new(&self.config).unwrap()
+        Connector::new(&self.config.peer).unwrap()
     }
 }
 impl Drop for Fixture {
@@ -260,8 +263,8 @@ async fn udp_uses_existing_forward_handler() {
 async fn authentication_failures_reach_application_io() {
     let fixture = Fixture::new().await;
     let mut config = fixture.config.clone();
-    config.anytls.as_mut().unwrap().password = "wrong".into();
-    let connector = Connector::new(&config).unwrap();
+    config.peer.anytls.as_mut().unwrap().password = "wrong".into();
+    let connector = Connector::new(&config.peer).unwrap();
     let error = timeout(
         Duration::from_secs(3),
         connect_tcp_tunnel(connector.clone(), "127.0.0.1:1"),
@@ -277,8 +280,8 @@ async fn authentication_failures_reach_application_io() {
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::BrokenPipe
     ));
-    config.server_name = "wrong.example".into();
-    let mut connector = Connector::new(&config).unwrap();
+    config.peer.server_name = "wrong.example".into();
+    let mut connector = Connector::new(&config.peer).unwrap();
     assert!(connector.open_tunnel().await.is_err());
 }
 
@@ -329,7 +332,7 @@ fn config_rejects_reverse_and_redacts_password() {
         "anytls does not support reverse_proxy"
     );
     reverse.reverse_proxy.clear();
-    reverse.anytls = None;
+    reverse.peer.anytls = None;
     assert_eq!(
         reverse.validate().unwrap_err().to_string(),
         "anytls.password is required"
@@ -342,7 +345,7 @@ async fn probe_settings(
     protocols: Option<Vec<Vec<u8>>>,
 ) -> io::Result<()> {
     timeout(Duration::from_secs(3), async {
-        let tcp = TcpStream::connect(fixture.config.server_addr).await?;
+        let tcp = TcpStream::connect(fixture.config.peer.server_addr).await?;
         let name = ServerName::try_from("localhost").unwrap();
         let mut stream = match protocols {
             Some(protocols) => connector.with_alpn(protocols).connect(name, tcp).await?,
@@ -372,7 +375,11 @@ async fn mutual_tls_requires_a_trusted_client_certificate() {
     let fixture = Fixture::new().await;
     probe_settings(
         &fixture,
-        tls::client(&fixture.config.server_cert, &fixture.config.private_key).unwrap(),
+        tls::client(
+            &fixture.config.peer.server_cert,
+            &fixture.config.peer.private_key,
+        )
+        .unwrap(),
         None,
     )
     .await
@@ -380,7 +387,7 @@ async fn mutual_tls_requires_a_trusted_client_certificate() {
     for untrusted in [false, true] {
         let mut roots = rustls::RootCertStore::empty();
         roots
-            .add(CertificateDer::from_pem_file(&fixture.config.server_cert).unwrap())
+            .add(CertificateDer::from_pem_file(&fixture.config.peer.server_cert).unwrap())
             .unwrap();
         let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
@@ -392,8 +399,8 @@ async fn mutual_tls_requires_a_trusted_client_certificate() {
             let other = Fixture::new().await;
             builder
                 .with_client_auth_cert(
-                    vec![CertificateDer::from_pem_file(&other.config.server_cert).unwrap()],
-                    PrivateKeyDer::from_pem_file(&other.config.private_key).unwrap(),
+                    vec![CertificateDer::from_pem_file(&other.config.peer.server_cert).unwrap()],
+                    PrivateKeyDer::from_pem_file(&other.config.peer.private_key).unwrap(),
                 )
                 .unwrap()
         } else {
@@ -411,7 +418,11 @@ async fn mutual_tls_requires_a_trusted_client_certificate() {
 #[tokio::test]
 async fn unknown_alpn_and_anytls_on_legacy_route_fail() {
     let fixture = Fixture::new().await;
-    let connector = tls::client(&fixture.config.server_cert, &fixture.config.private_key).unwrap();
+    let connector = tls::client(
+        &fixture.config.peer.server_cert,
+        &fixture.config.peer.private_key,
+    )
+    .unwrap();
     for protocols in [vec![], vec![b"other-protocol".to_vec()]] {
         assert!(
             probe_settings(&fixture, connector.clone(), Some(protocols))
@@ -457,9 +468,9 @@ async fn cancelled_public_server_closes_authenticated_and_legacy_transports() {
     fixture.server.abort();
     assert!((&mut fixture.server).await.unwrap_err().is_cancelled());
     let config = ServerConfig {
-        listen: fixture.config.server_addr,
-        cert: fixture.config.server_cert.clone(),
-        priv_key: fixture.config.private_key.clone(),
+        listen: fixture.config.peer.server_addr,
+        cert: fixture.config.peer.server_cert.clone(),
+        priv_key: fixture.config.peer.private_key.clone(),
         anytls: Some(crate::config::ServerAnyTlsConfig {
             password: "test-secret".into(),
         }),
@@ -468,7 +479,7 @@ async fn cancelled_public_server_closes_authenticated_and_legacy_transports() {
     let listener_task = tokio::spawn(async move { crate::tlstcp::server::serve(&config).await });
     let tcp = timeout(Duration::from_secs(3), async {
         loop {
-            if let Ok(tcp) = TcpStream::connect(fixture.config.server_addr).await {
+            if let Ok(tcp) = TcpStream::connect(fixture.config.peer.server_addr).await {
                 break tcp;
             }
             tokio::task::yield_now().await;
@@ -476,7 +487,11 @@ async fn cancelled_public_server_closes_authenticated_and_legacy_transports() {
     })
     .await
     .unwrap();
-    let connector = tls::client(&fixture.config.server_cert, &fixture.config.private_key).unwrap();
+    let connector = tls::client(
+        &fixture.config.peer.server_cert,
+        &fixture.config.peer.private_key,
+    )
+    .unwrap();
     let mut stream = connector
         .connect(ServerName::try_from("localhost").unwrap(), tcp)
         .await
@@ -703,8 +718,8 @@ async fn cancelled_forward_open_releases_consumed_client() {
     let fixture = Fixture::new().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut config = fixture.config.clone();
-    config.server_addr = listener.local_addr().unwrap();
-    let acceptor = test_acceptor(&config.server_cert, &config.private_key);
+    config.peer.server_addr = listener.local_addr().unwrap();
+    let acceptor = test_acceptor(&config.peer.server_cert, &config.peer.private_key);
     let (accepted, ready) = tokio::sync::oneshot::channel();
     let peer = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
@@ -728,7 +743,7 @@ async fn cancelled_forward_open_releases_consumed_client() {
             }
         }
     });
-    let opener = Connector::new(&config).unwrap();
+    let opener = Connector::new(&config.peer).unwrap();
     let opening = tokio::spawn(async move { connect_tcp_tunnel(opener, "127.0.0.1:1").await });
     timeout(Duration::from_secs(3), ready)
         .await
@@ -758,12 +773,15 @@ async fn tls_connect(
     fixture: &Fixture,
     protocols: Vec<Vec<u8>>,
 ) -> io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
-    let tcp = TcpStream::connect(fixture.config.server_addr).await?;
-    tls::client(&fixture.config.server_cert, &fixture.config.private_key)
-        .unwrap()
-        .with_alpn(protocols)
-        .connect(ServerName::try_from("localhost").unwrap(), tcp)
-        .await
+    let tcp = TcpStream::connect(fixture.config.peer.server_addr).await?;
+    tls::client(
+        &fixture.config.peer.server_cert,
+        &fixture.config.peer.private_key,
+    )
+    .unwrap()
+    .with_alpn(protocols)
+    .connect(ServerName::try_from("localhost").unwrap(), tcp)
+    .await
 }
 
 async fn legacy_flow(
@@ -890,7 +908,11 @@ async fn full_server_sessions_leave_legacy_admission_available_and_recover() {
         fixture.wait_for_transport_release().await;
         probe_settings(
             &fixture,
-            tls::client(&fixture.config.server_cert, &fixture.config.private_key).unwrap(),
+            tls::client(
+                &fixture.config.peer.server_cert,
+                &fixture.config.peer.private_key,
+            )
+            .unwrap(),
             None,
         )
         .await
@@ -905,14 +927,14 @@ async fn slow_handshake_slots_reject_excess_and_recover_after_failure_and_timeou
     let mut pending = Vec::new();
     for _ in 0..64 {
         pending.push(
-            TcpStream::connect(fixture.config.server_addr)
+            TcpStream::connect(fixture.config.peer.server_addr)
                 .await
                 .unwrap(),
         );
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(fixture.state.slots.available_permits(), MAX_SESSIONS);
-    let mut excess = TcpStream::connect(fixture.config.server_addr)
+    let mut excess = TcpStream::connect(fixture.config.peer.server_addr)
         .await
         .unwrap();
     assert_eq!(
@@ -961,16 +983,19 @@ async fn slow_handshake_slots_reject_excess_and_recover_after_failure_and_timeou
 #[tokio::test]
 async fn slow_tls_and_auth_share_one_accept_time_deadline() {
     let fixture = Fixture::new().await;
-    let tcp = TcpStream::connect(fixture.config.server_addr)
+    let tcp = TcpStream::connect(fixture.config.peer.server_addr)
         .await
         .unwrap();
     let started = Instant::now();
     tokio::time::sleep(Duration::from_secs(6)).await;
-    let mut stream = tls::client(&fixture.config.server_cert, &fixture.config.private_key)
-        .unwrap()
-        .connect(ServerName::try_from("localhost").unwrap(), tcp)
-        .await
-        .unwrap();
+    let mut stream = tls::client(
+        &fixture.config.peer.server_cert,
+        &fixture.config.peer.private_key,
+    )
+    .unwrap()
+    .connect(ServerName::try_from("localhost").unwrap(), tcp)
+    .await
+    .unwrap();
     timeout(Duration::from_secs(1), async {
         while fixture.state.slots.available_permits() == MAX_SESSIONS {
             tokio::task::yield_now().await;
@@ -987,7 +1012,11 @@ async fn slow_tls_and_auth_share_one_accept_time_deadline() {
     fixture.wait_for_transport_release().await;
     probe_settings(
         &fixture,
-        tls::client(&fixture.config.server_cert, &fixture.config.private_key).unwrap(),
+        tls::client(
+            &fixture.config.peer.server_cert,
+            &fixture.config.peer.private_key,
+        )
+        .unwrap(),
         None,
     )
     .await
