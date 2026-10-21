@@ -26,6 +26,19 @@ async fn tlstcp_client(
     futures::try_join!(h, s).map(|_| ())
 }
 
+async fn anytls_client(
+    config: ClientConfig,
+    http_listener: TcpListener,
+    socks5_listener: TcpListener,
+) -> std::io::Result<()> {
+    let connector = stunnel::anytls::Connector::new(&config)?;
+    futures::try_join!(
+        proxy::accept_http_tunnels(&http_listener, &connector, "anytls"),
+        proxy::accept_socks5_tunnels(&socks5_listener, &connector, "anytls"),
+    )
+    .map(|_| ())
+}
+
 async fn quinn_client(
     config: ClientConfig,
     http_listener: TcpListener,
@@ -186,6 +199,7 @@ async fn main() {
     info!("starting up");
 
     let result = match config.tunnel_type {
+        TunnelType::AnyTls => anytls_client(config, http_listener, socks5_listener).await,
         TunnelType::TlsTcp => tlstcp_client(config, http_listener, socks5_listener).await,
         TunnelType::Quinn => quinn_client(config, http_listener, socks5_listener).await,
         TunnelType::S2nQuic => s2n_client(config, http_listener, socks5_listener).await,

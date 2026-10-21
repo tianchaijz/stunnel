@@ -1,0 +1,143 @@
+[package]
+name = "anytls"
+version = "0.5.1"
+edition = "2024"
+authors = ["@ssrlive"]
+description = "A proxy protocol that attempts to mitigate the TLS in TLS fingerprinting problem"
+license = "MIT"
+repository = "https://github.com/ssrlive/anytls-rs"
+keywords = ["proxy", "tls", "privacy", "networking"]
+categories = ["network-programming", "command-line-utilities"]
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "anytls-server"
+path = "bin/server.rs"
+required-features = ["server", "relay", "ctrlc2"]
+
+[[bin]]
+name = "anytls-client"
+path = "bin/client.rs"
+required-features = ["client", "relay", "ctrlc2"]
+
+[features]
+default = ["client", "server", "relay", "ctrlc2", "ffi", "panel-sync"]
+ffi = ["client", "relay"]
+core = ["dep:md-5", "dep:rand", "dep:sha2", "dep:uuid"]
+async = ["core", "dep:tokio", "tokio/io-util"]
+runtime = ["async", "dep:log", "dep:tokio-util", "tokio/macros", "tokio/sync", "tokio/time"]
+uot = ["async", "dep:bytes", "dep:socks5-impl"]
+relay = ["dep:tokio", "tokio/io-util", "tokio/macros"]
+panel-sync = [
+    "dep:log",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tokio",
+    "tokio/macros",
+    "tokio/net",
+    "tokio/rt",
+    "tokio/sync",
+    "tokio/time",
+    "dep:tokio-util",
+    "dep:url",
+    "dep:uuid",
+]
+client = [
+    "runtime",
+    "uot",
+    "dep:clap",
+    "dep:env_logger",
+    "dep:percent-encoding",
+    "dep:shlex",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:rustls-pemfile",
+    "dep:serde",
+    "dep:tokio-rustls",
+    "dep:url",
+    "tokio/fs",
+    "tokio/net",
+    "tokio/rt-multi-thread",
+    "socks-hub/httpproxy",
+]
+server = [
+    "runtime",
+    "uot",
+    "dep:clap",
+    "dep:env_logger",
+    "dep:notify",
+    "dep:percent-encoding",
+    "dep:rcgen",
+    "dep:reqwest",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:rustls-pemfile",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tokio-rustls",
+    "dep:url",
+    "dep:x509-parser",
+    "tokio/fs",
+    "tokio/net",
+    "tokio/rt-multi-thread",
+    "socks5-impl/client",
+]
+
+[dependencies]
+bytes = { version = "1.12.1", optional = true }
+clap = { version = "4.6.7", features = [
+    "derive",
+    "wrap_help",
+], optional = true }
+ctrlc2 = { version = "4.0.0", optional = true, default-features = false, features = [
+    "async",
+    "termination",
+] }
+env_logger = { version = "0.11.11", optional = true }
+log = { version = "0.4.34", features = ["serde"], optional = true }
+md-5 = { version = "0.11.0", optional = true }
+method_name = { version = "0.3.4", default-features = false, features = [
+    "unstable",
+] }
+notify = { version = "8.2.0", optional = true }
+percent-encoding = { version = "2.3.2", optional = true }
+rand = { version = "0.10.3", optional = true }
+rcgen = { version = "0.14.10", optional = true }
+reqwest = { version = "0.13.5", default-features = false, features = [
+    "json",
+    "rustls",
+], optional = true }
+rustls = { version = "0.23.46", optional = true }
+rustls-native-certs = { version = "0.8.5", optional = true }
+rustls-pemfile = { version = "2.2.0", optional = true }
+serde = { version = "1.0.229", features = ["derive"], optional = true }
+serde_json = { version = "1.0.154", optional = true }
+shlex = { version = "2.0.1", optional = true }
+sha2 = { version = "0.11.1", optional = true }
+socks-hub = { version = "0.2.12", default-features = false, optional = true }
+socks5-impl = { version = "0.10.0", features = [
+    "server",
+    "serde",
+], optional = true }
+tokio = { version = "1.53.3", default-features = false, optional = true }
+tokio-rustls = { version = "0.26.6", optional = true }
+tokio-util = { version = "0.7.20", features = ["rt"], optional = true }
+url = { version = "2.5.8", features = ["serde"], optional = true }
+uuid = { version = "1.28.0", features = ["serde", "v4"], optional = true }
+x509-parser = { version = "0.18.1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.53.3", default-features = false, features = [
+    "io-util",
+    "macros",
+    "rt",
+    "test-util",
+] }
+
+[[bench]]
+name = "runtime"
+harness = false
+required-features = ["runtime"]

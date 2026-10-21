@@ -1,0 +1,23 @@
+language = "C"
+cpp_compat = true
+include_guard = "ANYTLS_H"
+documentation = true
+
+[export]
+include = [
+    "anytls_client_run",
+    "anytls_client_stop",
+    "anytls_generate_url",
+    "anytls_set_log_callback",
+    "anytls_set_traffic_status_callback",
+    "LogLevel",
+    "TrafficStatus",
+]
+item_types = ["functions", "structs", "enums"]
+
+[export.rename]
+"LogLevel" = "AnyTlsLogLevel"
+"TrafficStatus" = "AnyTlsTrafficStatus"
+
+[enum]
+prefix_with_name = true

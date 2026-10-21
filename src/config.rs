@@ -12,6 +12,8 @@ use crate::quic::{CongestionControl, QuicConfig};
 pub enum TunnelType {
     #[serde(rename = "tlstcp")]
     TlsTcp,
+    #[serde(rename = "anytls")]
+    AnyTls,
     #[serde(rename = "quic")]
     Quinn,
     #[serde(rename = "s2n-quic")]
@@ -43,6 +45,8 @@ pub struct ClientConfig {
     pub private_key: PathBuf,
     pub tunnel_type: TunnelType,
 
+    pub anytls: Option<ClientAnyTlsConfig>,
+
     #[serde(default)]
     pub reverse_proxy: Vec<ReverseProxyConfig>,
 
@@ -57,8 +61,19 @@ pub struct ClientConfig {
 impl ClientConfig {
     pub fn validate(&self) -> io::Result<()> {
         validate_non_empty(&self.server_name, "server_name")?;
-        if !matches!(self.tunnel_type, TunnelType::TlsTcp) {
+        if matches!(self.tunnel_type, TunnelType::Quinn | TunnelType::S2nQuic) {
             validate_quic(&self.quic)?;
+        }
+
+        if self.tunnel_type == TunnelType::AnyTls {
+            let anytls = self
+                .anytls
+                .as_ref()
+                .ok_or_else(|| invalid_config("anytls.password is required"))?;
+            validate_non_empty(&anytls.password, "anytls.password")?;
+            if !self.reverse_proxy.is_empty() {
+                return Err(invalid_config("anytls does not support reverse_proxy"));
+            }
         }
 
         #[cfg(target_os = "macos")]
@@ -84,13 +99,45 @@ pub struct ServerConfig {
     pub priv_key: PathBuf,
     pub cert: PathBuf,
 
+    pub anytls: Option<ServerAnyTlsConfig>,
+
     #[serde(default)]
     pub quic: ServerQuicConfig,
 }
 
 impl ServerConfig {
     pub fn validate(&self) -> io::Result<()> {
+        if let Some(anytls) = &self.anytls {
+            validate_non_empty(&anytls.password, "anytls.password")?;
+        }
         validate_quic(&self.quic.transport)
+    }
+}
+
+#[derive(Clone, Deserialize)]
+pub struct ClientAnyTlsConfig {
+    pub password: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerAnyTlsConfig {
+    pub password: String,
+}
+
+impl std::fmt::Debug for ClientAnyTlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientAnyTlsConfig")
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ServerAnyTlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerAnyTlsConfig")
+            .field("password", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -201,6 +248,7 @@ mod tests {
             server_cert: PathBuf::new(),
             private_key: PathBuf::new(),
             tunnel_type: TunnelType::TlsTcp,
+            anytls: None,
             reverse_proxy: vec![ReverseProxyConfig {
                 listen: "127.0.0.1:8081".parse().unwrap(),
                 target: "127.0.0.1:3000".parse().unwrap(),

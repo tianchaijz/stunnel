@@ -1,0 +1,11 @@
+.venv
+/Cargo.lock
+/target
+/include/anytls.h
+/.VSCodeCounter
+/dist
+/cmd/client/client
+/cmd/server/server
+*.exe
+*.zip
+.vscode

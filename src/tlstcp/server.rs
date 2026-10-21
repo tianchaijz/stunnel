@@ -45,6 +45,15 @@ pub async fn new(config: &Config) -> std::io::Result<Acceptor> {
 }
 
 async fn new_server(config: &Config) -> Result<Acceptor, Box<dyn Error + Send + Sync>> {
+    let acceptor = tls_acceptor(config, false)?;
+    let listener = TcpListener::bind(config.addr).await?;
+    Ok(Acceptor { listener, acceptor })
+}
+
+pub(crate) fn tls_acceptor(
+    config: &Config,
+    anytls: bool,
+) -> Result<TlsAcceptor, Box<dyn Error + Send + Sync>> {
     let cert = CertificateDer::from_pem_file(&config.cert)?;
     let priv_key = PrivateKeyDer::from_pem_file(&config.priv_key)?;
 
@@ -61,7 +70,80 @@ async fn new_server(config: &Config) -> Result<Acceptor, Box<dyn Error + Send + 
         .with_single_cert(vec![cert], priv_key)?;
     server_config.alpn_protocols = vec![b"stunnel".to_vec()];
 
-    let listener = TcpListener::bind(config.addr).await?;
-    let acceptor = TlsAcceptor::from(Arc::new(server_config));
-    Ok(Acceptor { listener, acceptor })
+    if anytls {
+        server_config
+            .alpn_protocols
+            .push(crate::anytls::ALPN.to_vec());
+    }
+    Ok(TlsAcceptor::from(Arc::new(server_config)))
+}
+
+const MAX_HANDSHAKES: usize = 64;
+const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Serve legacy TLS and optional AnyTLS on the main TCP address.
+/// At most 64 TLS handshakes run concurrently, independently of AnyTLS sessions.
+pub async fn serve(config: &crate::config::ServerConfig) -> std::io::Result<()> {
+    config.validate()?;
+    let acceptor = tls_acceptor(
+        &Config {
+            addr: config.listen,
+            cert: config.cert.clone(),
+            priv_key: config.priv_key.clone(),
+        },
+        config.anytls.is_some(),
+    )
+    .map_err(std::io::Error::other)?;
+    let listener = TcpListener::bind(config.listen).await?;
+    let anytls = config
+        .anytls
+        .as_ref()
+        .map(|options| Arc::new(crate::anytls::Server::new(options.password.clone())));
+    serve_listener(listener, acceptor, anytls).await
+}
+
+pub(crate) async fn serve_listener(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    anytls: Option<Arc<crate::anytls::Server>>,
+) -> std::io::Result<()> {
+    let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_HANDSHAKES));
+    let mut tasks = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (tcp, _) = accepted?;
+                let deadline = tokio::time::Instant::now() + ADMISSION_TIMEOUT;
+                let Ok(permit) = handshakes.clone().try_acquire_owned() else { continue; };
+                let acceptor = acceptor.clone();
+                let anytls = anytls.clone();
+                tasks.spawn(async move {
+                    let result = async {
+                        tcp.set_nodelay(true)?;
+                        let stream = tokio::time::timeout_at(deadline, acceptor.accept(tcp)).await
+                            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS admission timed out"))??;
+                        drop(permit);
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS admission timed out"));
+                        }
+                        let protocol = stream.get_ref().1.alpn_protocol().map(Vec::from);
+                        let result = if protocol.as_deref() == Some(crate::anytls::ALPN) {
+                            anytls.as_ref().expect("advertised AnyTLS must be enabled").accept(stream, deadline).await
+                        } else {
+                            let (reader, writer) = super::split(TlsStream::Server(stream));
+                            crate::tunnel::server::handle_forward_tunnel(writer, reader).await.map(|_| ())
+                        };
+                        if let Err(error) = &result {
+                            log::debug!("TCP protocol {protocol:?} ended: {error}");
+                        }
+                        result
+                    }.await;
+                    if let Err(error) = result { log::debug!("TCP connection ended: {error}"); }
+                });
+            }
+            completed = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(error)) = completed { log::error!("TCP task failed: {error}"); }
+            }
+        }
+    }
 }

@@ -6,6 +6,7 @@ edition = "2024"
 build = "build.rs"
 
 [dependencies]
+anytls-protocol = { package = "anytls", path = "vendor/anytls-rs", default-features = false, features = ["runtime"] }
 socks5 = { git = "https://github.com/airtrack/sproxy.git", tag = "0.1.1" }
 httpproxy = { git = "https://github.com/airtrack/sproxy.git", tag = "0.1.1" }
 chrono = "0.4"

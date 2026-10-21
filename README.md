@@ -40,6 +40,26 @@ Simple SOCKS5/HTTP tunnel. SOCKS5 on client side provides NO AUTHENTICATION TCP/
 
 Browser connect client address(`127.0.0.1:1080`) via SOCKS5 or connect client address(`127.0.0.1:8080`) via HTTP.
 
+## AnyTLS
+
+Set `tunnel_type = "anytls"` and point `server_addr` at the main server TCP address.
+
+```toml
+# client.toml
+server_addr = "127.0.0.1:12345"
+tunnel_type = "anytls"
+anytls = { password = "replace-with-a-shared-secret" }
+```
+
+```toml
+# server.toml
+anytls = { password = "replace-with-a-shared-secret" }
+```
+
+Use the existing certificate and private key settings on both peers. AnyTLS uses mutual TLS and password authentication. HTTP, SOCKS TCP and SOCKS UDP use the existing client listeners. Reverse proxy configuration is rejected for this transport.
+
+This integration uses the original Rust library and STunnel's inner forwarding protocol. See [the design](docs/anytls-design.md), [the comparison](docs/anytls-comparison.md) and [verification](docs/anytls-verification.md).
+
 ## Reverse proxy(`quic`/`s2n-quic`)
 
 The client can register reverse TCP listeners on the server: the server listens
