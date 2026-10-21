@@ -101,3 +101,7 @@ opens streams on the same QUIC connection.
     |    router     |             |  to autoproxy  |
     -----------------             ------------------
 ```
+
+### Relay through another server
+
+A server can forward all TCP and UDP tunnels through another STunnel server using an optional `[upstream]` table. Both encrypted hops independently support TLS/TCP, AnyTLS, Quinn, and s2n-quic. See [the relay guide](docs/relay.md) and [sample relay configuration](config/relay.toml).

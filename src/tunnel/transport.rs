@@ -1,5 +1,10 @@
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::Tunnel;
 
@@ -22,4 +27,37 @@ pub trait AcceptTunnel: Send + 'static {
     type R: AsyncRead + Send + Unpin;
 
     async fn accept_tunnel(&mut self) -> std::io::Result<Tunnel<Self::S, Self::R>>;
+}
+
+pub(crate) struct OwnedIo<T, O> {
+    pub(crate) stream: T,
+    pub(crate) _owner: O,
+}
+
+impl<T: AsyncRead + Unpin, O: Unpin> AsyncRead for OwnedIo<T, O> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin, O: Unpin> AsyncWrite for OwnedIo<T, O> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
 }

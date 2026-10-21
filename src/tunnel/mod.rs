@@ -4,9 +4,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 pub mod client;
 pub mod server;
+pub mod upstream;
 
 mod protocol;
-mod transport;
+pub(crate) mod transport;
 
 pub use protocol::{AsyncReadDatagramExt, AsyncWriteDatagramExt};
 pub(crate) use protocol::{

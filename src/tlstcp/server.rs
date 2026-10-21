@@ -8,6 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
 use super::TlsStream;
+use crate::tunnel::upstream::Forwarding;
 
 pub struct Config {
     pub addr: SocketAddr,
@@ -84,6 +85,15 @@ const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// Serve legacy TLS and optional AnyTLS on the main TCP address.
 /// At most 64 TLS handshakes run concurrently, independently of AnyTLS sessions.
 pub async fn serve(config: &crate::config::ServerConfig) -> std::io::Result<()> {
+    let route = Forwarding::new(config.upstream.as_ref())?;
+    serve_routed(config, route).await
+}
+
+/// Serve TCP using a route shared with the process's QUIC listener.
+pub async fn serve_routed(
+    config: &crate::config::ServerConfig,
+    route: Forwarding,
+) -> std::io::Result<()> {
     config.validate()?;
     let acceptor = tls_acceptor(
         &Config {
@@ -99,13 +109,14 @@ pub async fn serve(config: &crate::config::ServerConfig) -> std::io::Result<()> 
         .anytls
         .as_ref()
         .map(|options| Arc::new(crate::anytls::Server::new(options.password.clone())));
-    serve_listener(listener, acceptor, anytls).await
+    serve_listener(listener, acceptor, anytls, route).await
 }
 
 pub(crate) async fn serve_listener(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     anytls: Option<Arc<crate::anytls::Server>>,
+    route: Forwarding,
 ) -> std::io::Result<()> {
     let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_HANDSHAKES));
     let mut tasks = tokio::task::JoinSet::new();
@@ -117,6 +128,7 @@ pub(crate) async fn serve_listener(
                 let Ok(permit) = handshakes.clone().try_acquire_owned() else { continue; };
                 let acceptor = acceptor.clone();
                 let anytls = anytls.clone();
+                let route = route.clone();
                 tasks.spawn(async move {
                     let result = async {
                         tcp.set_nodelay(true)?;
@@ -128,10 +140,10 @@ pub(crate) async fn serve_listener(
                         }
                         let protocol = stream.get_ref().1.alpn_protocol().map(Vec::from);
                         let result = if protocol.as_deref() == Some(crate::anytls::ALPN) {
-                            anytls.as_ref().expect("advertised AnyTLS must be enabled").accept(stream, deadline).await
+                            anytls.as_ref().expect("advertised AnyTLS must be enabled").accept(stream, deadline, route).await
                         } else {
                             let (reader, writer) = super::split(TlsStream::Server(stream));
-                            crate::tunnel::server::handle_forward_tunnel(writer, reader).await.map(|_| ())
+                            crate::tunnel::server::handle_routed_forward(writer, reader, &route).await.map(|_| ())
                         };
                         if let Err(error) = &result {
                             log::debug!("TCP protocol {protocol:?} ended: {error}");

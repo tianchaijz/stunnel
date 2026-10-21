@@ -108,6 +108,8 @@ pub struct ServerQuicConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
+    pub upstream: Option<PeerConfig>,
+
     pub listen: SocketAddr,
     pub priv_key: PathBuf,
     pub cert: PathBuf,
@@ -122,6 +124,21 @@ impl ServerConfig {
     pub fn validate(&self) -> io::Result<()> {
         if let Some(anytls) = &self.anytls {
             validate_non_empty(&anytls.password, "anytls.password")?;
+        }
+        if let Some(peer) = &self.upstream {
+            peer.validate()?;
+            let listen = self.listen;
+            let target = peer.server_addr;
+            let listen_ip = listen.ip().to_canonical();
+            let target_ip = target.ip().to_canonical();
+            if listen.port() == target.port()
+                && (listen_ip == target_ip
+                    || (listen_ip.is_unspecified()
+                        && (listen_ip.is_ipv6() || target_ip.is_ipv4())
+                        && (target_ip.is_loopback() || target_ip.is_unspecified())))
+            {
+                return Err(invalid_config("upstream points to this server's listener"));
+            }
         }
         validate_quic(&self.quic.transport)
     }
@@ -279,5 +296,68 @@ mod tests {
         };
 
         assert!(config.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+    const SERVER: &str = "listen='127.0.0.1:443'\npriv_key='key.pem'\ncert='cert.pem'\n";
+    const PEER: &str = "server_addr='127.0.0.1:444'\nserver_name='exit'\nserver_cert='exit.pem'\nprivate_key='exit.key'\ntunnel_type='tlstcp'\n";
+
+    #[test]
+    fn existing_client_tables_remain_flattened() {
+        let client: ClientConfig = toml::from_str(&format!("socks5_listen='127.0.0.1:1080'\nhttp_listen='127.0.0.1:8080'\n{PEER}\n[quic]\ncc='bbr'\n")).unwrap();
+        assert_eq!(client.peer.server_name, "exit");
+        assert!(client.validate().is_ok());
+    }
+
+    #[test]
+    fn upstream_rejects_listener_and_reverse_fields() {
+        for field in [
+            "socks5_listen='127.0.0.1:1080'",
+            "http_listen='127.0.0.1:8080'",
+            "reverse_proxy=[]",
+            "listen='127.0.0.1:444'",
+            "typo=true",
+        ] {
+            assert!(
+                toml::from_str::<ServerConfig>(&format!("{SERVER}[upstream]\n{PEER}{field}\n"))
+                    .is_err(),
+                "accepted {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn obvious_self_loops_are_rejected_but_remote_same_port_is_valid() {
+        for (listen, target, valid) in [
+            ("127.0.0.1:443", "127.0.0.1:443", false),
+            ("0.0.0.0:443", "127.0.0.1:443", false),
+            ("[::]:443", "[::1]:443", false),
+            ("[::]:443", "127.0.0.1:443", false),
+            ("[::]:443", "[::ffff:127.0.0.1]:443", false),
+            ("0.0.0.0:443", "[::ffff:127.0.0.1]:443", false),
+            ("127.0.0.1:443", "[::ffff:127.0.0.1]:443", false),
+            ("[::]:443", "192.0.2.1:443", true),
+            ("0.0.0.0:443", "192.0.2.1:443", true),
+        ] {
+            for transport in ["tlstcp", "anytls", "quic", "s2n-quic"] {
+                let text = format!(
+                    "{}[anytls]\npassword='inbound-secret'\n[upstream]\n{}\n[upstream.anytls]\npassword='outbound-secret'\n",
+                    SERVER.replace("127.0.0.1:443", listen),
+                    PEER.replace("127.0.0.1:444", target)
+                        .replace("tlstcp", transport)
+                );
+                assert_eq!(
+                    toml::from_str::<ServerConfig>(&text)
+                        .unwrap()
+                        .validate()
+                        .is_ok(),
+                    valid,
+                    "listen {listen}, upstream {target}, transport {transport}"
+                );
+            }
+        }
     }
 }

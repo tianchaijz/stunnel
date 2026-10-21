@@ -1,13 +1,14 @@
 use clap::Parser;
 use log::{error, info};
 use quinn::Connection;
+use stunnel::tunnel::upstream::Forwarding;
 use stunnel::{
     config::{self, QuicBackend, ServerConfig},
     print_version, quic, tlstcp,
-    tunnel::server::handle_all_kinds_tunnels,
+    tunnel::server::handle_routed_tunnels,
 };
 
-async fn quinn_server(config: ServerConfig) -> std::io::Result<()> {
+async fn quinn_server(config: ServerConfig, route: Forwarding) -> std::io::Result<()> {
     let quic_config = quic::Config {
         addr: config.listen,
         cert: config.cert,
@@ -16,15 +17,17 @@ async fn quinn_server(config: ServerConfig) -> std::io::Result<()> {
     };
     let endpoint = quic::quinn::server::new(&quic_config)?;
 
+    let mut tasks = tokio::task::JoinSet::new();
     loop {
-        let incoming = endpoint
-            .accept()
-            .await
-            .ok_or(std::io::Error::other("endpoint closed"))?;
+        let incoming = tokio::select! {
+            accepted = endpoint.accept() => accepted.ok_or(std::io::Error::other("endpoint closed"))?,
+            _ = tasks.join_next(), if !tasks.is_empty() => continue,
+        };
 
-        tokio::spawn(async move {
+        let route = route.clone();
+        tasks.spawn(async move {
             if let Ok(conn) = incoming.await {
-                handle_quinn_conn(conn)
+                handle_quinn_conn(conn, route)
                     .await
                     .inspect_err(|error| {
                         error!("handle quic conn error: {error}");
@@ -35,11 +38,11 @@ async fn quinn_server(config: ServerConfig) -> std::io::Result<()> {
     }
 }
 
-async fn handle_quinn_conn(conn: Connection) -> std::io::Result<()> {
-    handle_all_kinds_tunnels(conn.clone(), conn).await
+async fn handle_quinn_conn(conn: Connection, route: Forwarding) -> std::io::Result<()> {
+    handle_routed_tunnels(conn.clone(), conn, route).await
 }
 
-async fn s2n_server(config: ServerConfig) -> std::io::Result<()> {
+async fn s2n_server(config: ServerConfig, route: Forwarding) -> std::io::Result<()> {
     let quic_config = quic::Config {
         addr: config.listen,
         cert: config.cert,
@@ -48,14 +51,16 @@ async fn s2n_server(config: ServerConfig) -> std::io::Result<()> {
     };
     let mut endpoint = quic::s2n_quic::server::new(&quic_config)?;
 
+    let mut tasks = tokio::task::JoinSet::new();
     loop {
-        let conn = endpoint
-            .accept()
-            .await
-            .ok_or(std::io::Error::other("endpoint closed"))?;
+        let conn = tokio::select! {
+            accepted = endpoint.accept() => accepted.ok_or(std::io::Error::other("endpoint closed"))?,
+            _ = tasks.join_next(), if !tasks.is_empty() => continue,
+        };
 
-        tokio::spawn(async move {
-            handle_s2n_conn(conn)
+        let route = route.clone();
+        tasks.spawn(async move {
+            handle_s2n_conn(conn, route)
                 .await
                 .inspect_err(|error| {
                     error!("handle quic conn error: {error}");
@@ -65,9 +70,9 @@ async fn s2n_server(config: ServerConfig) -> std::io::Result<()> {
     }
 }
 
-async fn handle_s2n_conn(conn: s2n_quic::Connection) -> std::io::Result<()> {
+async fn handle_s2n_conn(conn: s2n_quic::Connection, route: Forwarding) -> std::io::Result<()> {
     let (conn, acceptor) = conn.split();
-    handle_all_kinds_tunnels(conn, acceptor).await
+    handle_routed_tunnels(conn, acceptor, route).await
 }
 
 #[derive(Parser)]
@@ -109,11 +114,18 @@ async fn main() {
         }
     };
 
-    let tcp = tlstcp::server::serve(&config);
+    let route = match Forwarding::new(config.upstream.as_ref()) {
+        Ok(route) => route,
+        Err(error) => {
+            eprintln!("failed to configure upstream: {error}");
+            return;
+        }
+    };
+    let tcp = tlstcp::server::serve_routed(&config, route.clone());
     let quic = async {
         match config.quic.server_type {
-            QuicBackend::S2nQuic => s2n_server(config.clone()).await,
-            QuicBackend::Quinn => quinn_server(config.clone()).await,
+            QuicBackend::S2nQuic => s2n_server(config.clone(), route).await,
+            QuicBackend::Quinn => quinn_server(config.clone(), route).await,
         }
     };
     let result = futures::try_join!(tcp, quic);

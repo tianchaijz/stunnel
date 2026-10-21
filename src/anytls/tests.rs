@@ -73,9 +73,14 @@ impl Fixture {
         let service = Arc::new(Server::new("test-secret".into()));
         let state = service.clone();
         let server = tokio::spawn(async move {
-            crate::tlstcp::server::serve_listener(listener, acceptor, enabled.then_some(service))
-                .await
-                .unwrap();
+            crate::tlstcp::server::serve_listener(
+                listener,
+                acceptor,
+                enabled.then_some(service),
+                crate::tunnel::upstream::Forwarding::Direct,
+            )
+            .await
+            .unwrap();
         });
         Self {
             config,
@@ -468,6 +473,7 @@ async fn cancelled_public_server_closes_authenticated_and_legacy_transports() {
     fixture.server.abort();
     assert!((&mut fixture.server).await.unwrap_err().is_cancelled());
     let config = ServerConfig {
+        upstream: None,
         listen: fixture.config.peer.server_addr,
         cert: fixture.config.peer.server_cert.clone(),
         priv_key: fixture.config.peer.private_key.clone(),
@@ -1035,4 +1041,166 @@ fn server_options_reject_obsolete_listener_and_empty_password() {
     assert!(stale.to_string().contains("unknown field `listen`"));
     let empty: ServerConfig = toml::from_str(&format!("{base}password=''\n")).unwrap();
     assert!(empty.validate().is_err());
+}
+
+struct BackpressuredRelay {
+    session: Arc<Session>,
+    peer: tokio::io::DuplexStream,
+    upstream: Arc<crate::tunnel::upstream::Upstream>,
+    _permits: Vec<crate::tunnel::upstream::RelayAdmission>,
+    task: tokio::task::JoinHandle<io::Result<()>>,
+}
+
+async fn backpressured_relay() -> BackpressuredRelay {
+    use crate::tunnel::upstream::{Forwarding, MAX_RELAY_FLOWS};
+    let fixture = Fixture::new().await;
+    let Forwarding::Upstream(upstream) = Forwarding::new(Some(&fixture.config.peer)).unwrap()
+    else {
+        unreachable!()
+    };
+    let permits = (0..MAX_RELAY_FLOWS - 1)
+        .map(|_| upstream.admit().unwrap())
+        .collect::<Vec<_>>();
+    let (transport, mut peer) = tokio::io::duplex(1);
+    let padding = PaddingFactory::new(b"stop=0").unwrap();
+    let settings = format!("v=2\npadding-md5={}\n", padding.md5);
+    let session = Session::new_server(
+        100,
+        Box::new(transport),
+        Arc::new(RwLock::new(padding)),
+        DEFAULT_MAX_SESSION_AGE,
+    );
+    session.run().await.unwrap();
+    let mut frame = anytls_protocol::Frame::new(anytls_protocol::Command::Settings, 0);
+    frame.data = settings.into_bytes();
+    peer.write_all(&frame.encode().unwrap()).await.unwrap();
+    assert_eq!(
+        anytls_protocol::Frame::read_from(&mut peer)
+            .await
+            .unwrap()
+            .command,
+        anytls_protocol::Command::ServerSettings
+    );
+    let serving = session.clone();
+    let route = Forwarding::Upstream(upstream.clone());
+    let task = tokio::spawn(async move { forward_streams(&serving, route).await });
+    peer.write_all(
+        &anytls_protocol::Frame::new(anytls_protocol::Command::Syn, 1)
+            .encode()
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    for _ in 0..100 {
+        if upstream.admit().is_err() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        upstream.admit().is_err(),
+        "SYN must acquire the final relay permit"
+    );
+    BackpressuredRelay {
+        session,
+        peer,
+        upstream,
+        _permits: permits,
+        task,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn relay_stalled_synack_releases_admission_at_setup_deadline() {
+    let relay = backpressured_relay().await;
+    tokio::time::advance(Duration::from_secs(11)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        relay.upstream.admit().is_ok(),
+        "stalled SynAck must release the relay permit after ten seconds"
+    );
+    relay.task.abort();
+    relay.session.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn relay_header_uses_budget_remaining_after_synack() {
+    let mut relay = backpressured_relay().await;
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert_eq!(
+        anytls_protocol::Frame::read_from(&mut relay.peer)
+            .await
+            .unwrap()
+            .command,
+        anytls_protocol::Command::SynAck
+    );
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(relay.upstream.admit().is_err());
+    tokio::time::advance(Duration::from_secs(5)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        relay.upstream.admit().is_ok(),
+        "header parsing must not receive a fresh ten-second budget after SynAck"
+    );
+    relay.task.abort();
+    relay.session.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_session_during_synack_releases_relay_admission() {
+    let relay = backpressured_relay().await;
+    relay.task.abort();
+    assert!(relay.task.await.unwrap_err().is_cancelled());
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(relay.upstream.admit().is_ok());
+    relay.session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn public_server_uses_configured_upstream() {
+    let exit = Fixture::new().await;
+    let mut relay = Fixture::new().await;
+    relay.server.abort();
+    assert!((&mut relay.server).await.unwrap_err().is_cancelled());
+    let config = ServerConfig {
+        upstream: Some(exit.config.peer.clone()),
+        listen: relay.config.peer.server_addr,
+        cert: relay.config.peer.server_cert.clone(),
+        priv_key: relay.config.peer.private_key.clone(),
+        anytls: Some(crate::config::ServerAnyTlsConfig {
+            password: "test-secret".into(),
+        }),
+        quic: Default::default(),
+    };
+    relay.server = tokio::spawn(async move {
+        crate::tlstcp::server::serve(&config).await.unwrap();
+    });
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if TcpStream::connect(relay.config.peer.server_addr)
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (address, target) = half_close_target().await;
+    assert_eq!(
+        request(relay.connector(), address, b"via upstream").await,
+        b"reply:via upstream"
+    );
+    assert_eq!(exit.state.sequence.load(Ordering::SeqCst), 1);
+    target.abort();
 }

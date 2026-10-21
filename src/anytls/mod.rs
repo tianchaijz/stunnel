@@ -2,7 +2,7 @@ mod tls;
 
 use crate::{
     config::PeerConfig,
-    tunnel::{OpenTunnel, Tunnel},
+    tunnel::{OpenTunnel, Tunnel, transport::OwnedIo, upstream::Forwarding},
 };
 use anytls_protocol::{
     BoxTransport, Client, DEFAULT_MAX_SESSION_AGE, DEFAULT_SCHEME, Dialer, PaddingFactory, Session,
@@ -12,16 +12,14 @@ use async_trait::async_trait;
 use rustls::pki_types::ServerName;
 use std::{
     io,
-    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    task::{Context, Poll},
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncWrite},
     net::TcpStream,
     runtime::Handle,
     sync::{RwLock, Semaphore},
@@ -31,39 +29,6 @@ use tokio::{
 pub type SendHalf = tokio::io::WriteHalf<BoxTransport>;
 pub type RecvHalf = tokio::io::ReadHalf<BoxTransport>;
 const MAX_SESSIONS: usize = 64;
-
-struct OwnedIo<T, O> {
-    stream: T,
-    _owner: O,
-}
-
-impl<T: AsyncRead + Unpin, O: Unpin> AsyncRead for OwnedIo<T, O> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_read(cx, buf)
-    }
-}
-
-impl<T: AsyncWrite + Unpin, O: Unpin> AsyncWrite for OwnedIo<T, O> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.stream).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_shutdown(cx)
-    }
-}
 
 struct ClientOwner {
     client: Arc<Client>,
@@ -172,6 +137,7 @@ impl Server {
         &self,
         mut stream: tokio_rustls::server::TlsStream<TcpStream>,
         deadline: Instant,
+        route: Forwarding,
     ) -> io::Result<()> {
         check_alpn(stream.get_ref().1.alpn_protocol())?;
         let permit = self.slots.clone().try_acquire_owned().map_err(|_| {
@@ -199,6 +165,7 @@ impl Server {
                 _owner: permit,
             },
             sequence,
+            route,
         )
         .await
     }
@@ -233,6 +200,7 @@ impl Drop for ServerSessionOwner {
 async fn server_session(
     transport: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     sequence: usize,
+    route: Forwarding,
 ) -> io::Result<()> {
     let padding = Arc::new(RwLock::new(
         PaddingFactory::new(DEFAULT_SCHEME).expect("built-in AnyTLS padding scheme"),
@@ -248,31 +216,54 @@ async fn server_session(
         runtime: Handle::current(),
     };
     session.run().await?;
-    let result = async {
-        let mut streams = tokio::task::JoinSet::new();
-        loop {
-            tokio::select! {
-                incoming = session.accept_stream() => {
-                    let stream = incoming?;
-                    stream.handshake_success().await?;
-                    let (reader, writer) = tokio::io::split(StreamIo::new(stream));
-                    streams.spawn(async move {
-                        if let Err(error) = crate::tunnel::server::handle_forward_tunnel(writer, reader).await {
-                            log::debug!("AnyTLS forward stream ended: {error}");
-                        }
-                    });
-                }
-                completed = streams.join_next(), if !streams.is_empty() => {
-                    if let Some(Err(error)) = completed {
-                        log::error!("AnyTLS forwarding task failed: {error}");
-                    }
-                }
-            }
-        }
-    }.await;
+    let result = forward_streams(&session, route).await;
     session.shutdown().await?;
     owner.session.take();
     result
+}
+
+async fn forward_streams(
+    session: &Arc<Session>,
+    route: crate::tunnel::upstream::Forwarding,
+) -> io::Result<()> {
+    let mut streams = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            incoming = session.accept_stream() => {
+                let stream = incoming?;
+                match &route {
+                    Forwarding::Direct => {
+                        stream.handshake_success().await?;
+                        let (reader, writer) = tokio::io::split(StreamIo::new(stream));
+                        streams.spawn(async move {
+                            if let Err(error) = crate::tunnel::server::handle_forward_tunnel(writer, reader).await {
+                                log::debug!("AnyTLS forward stream ended: {error}");
+                            }
+                        });
+                    }
+                    Forwarding::Upstream(upstream) => {
+                        let Ok(admission) = upstream.admit() else { continue; };
+                        let upstream = upstream.clone();
+                        streams.spawn(async move {
+                            let result = async {
+                                admission.setup(stream.handshake_success()).await?;
+                                let (reader, writer) = tokio::io::split(StreamIo::new(stream));
+                                crate::tunnel::server::relay(Tunnel::new(writer, reader), &upstream, admission).await
+                            }.await;
+                            if let Err(error) = result {
+                                log::debug!("AnyTLS relay stream ended: {error}");
+                            }
+                        });
+                    }
+                }
+            }
+            completed = streams.join_next(), if !streams.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    log::error!("AnyTLS forwarding task failed: {error}");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

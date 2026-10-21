@@ -158,3 +158,21 @@ where
         Err(std::io::Error::other("invalid addr"))
     }
 }
+
+pub(crate) async fn read_bind<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<(String, SocketAddr)> {
+    let length = reader.read_u8().await?;
+    let mut bytes = vec![0; length as usize];
+    reader.read_exact(&mut bytes).await?;
+    let text = String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid bind address")
+    })?;
+    let address = text.parse().map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid bind address: {error}"),
+        )
+    })?;
+    Ok((text, address))
+}

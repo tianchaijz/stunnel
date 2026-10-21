@@ -1,0 +1,22 @@
+# B accepts A with its own certificate. A's client config points to B.
+listen = "0.0.0.0:12345"
+priv_key = "relay-key.pem"
+cert = "relay-cert.pem"
+
+[quic]
+server_type = "s2n-quic"
+
+# Optional AnyTLS on the main TCP listener.
+[anytls]
+password = "replace-ab-secret"
+
+# C uses an ordinary server config without upstream.
+[upstream]
+server_addr = "192.0.2.30:12345"
+server_name = "exit.example"
+server_cert = "exit-cert.pem"
+private_key = "exit-key.pem"
+tunnel_type = "anytls"
+
+[upstream.anytls]
+password = "replace-bc-secret"

@@ -27,13 +27,7 @@ where
     tun.write_u8(TYPE_TCP_FWD).await?;
     tun.write_str8(target).await?;
 
-    let bind = tun.read_str8().await?;
-    let bind = bind.parse::<SocketAddr>().map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("invalid bind addr: {error}"),
-        )
-    })?;
+    let (_, bind) = super::protocol::read_bind(&mut tun).await?;
 
     Ok((bind, tun))
 }
@@ -47,7 +41,7 @@ where
     tun.write_u8(TYPE_UDP_FWD).await?;
 
     // server responds with its udp socket bind addr, not used by the caller
-    tun.read_str8().await?;
+    super::protocol::read_bind(&mut tun).await?;
 
     Ok(tun)
 }
