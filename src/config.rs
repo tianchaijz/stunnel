@@ -60,6 +60,9 @@ struct RawClientConfig {
     #[cfg(target_os = "macos")]
     #[serde(default)]
     macos_logging: MacOsLogging,
+    #[cfg(not(target_os = "macos"))]
+    #[serde(default, rename = "macos_logging")]
+    _macos_logging: Option<serde::de::IgnoredAny>,
     #[serde(flatten)]
     legacy: toml::Table,
 }
@@ -454,6 +457,42 @@ mod failover_tests {
     const CLIENT: &str = "socks5_listen='127.0.0.1:1080'\nhttp_listen='127.0.0.1:8080'\n";
     const SERVER: &str = "listen='127.0.0.1:443'\npriv_key='key.pem'\ncert='cert.pem'\n";
     const PEER: &str = "server_addr='127.0.0.1:444'\nserver_name='exit'\nserver_cert='exit.pem'\nprivate_key='exit.key'\ntunnel_type='quic'\n";
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn legacy_client_ignores_macos_logging() {
+        for value in ["{enable=false}", "{enable=true}", "['ignored', 42]"] {
+            let text = format!("{CLIENT}macos_logging={value}\n{PEER}");
+            let client: ClientConfig = toml::from_str(&text).unwrap();
+            client.validate().unwrap();
+            assert_eq!(client.servers.len(), 1);
+            assert_eq!(client.servers[0].server_name, "exit");
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn list_client_ignores_macos_logging() {
+        for value in ["{enable=false}", "{enable=true}", "['ignored', 42]"] {
+            let text = format!("{CLIENT}macos_logging={value}\n[[servers]]\n{PEER}");
+            let client: ClientConfig = toml::from_str(&text).unwrap();
+            client.validate().unwrap();
+            assert_eq!(client.servers.len(), 1);
+            assert_eq!(client.servers[0].server_name, "exit");
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn ignored_macos_logging_does_not_hide_unknown_peer_fields() {
+        for prefix in ["", "[[servers]]\n"] {
+            let text = format!(
+                "{CLIENT}macos_logging={{enable=false}}\n{prefix}{PEER}server_nmae='typo'\n"
+            );
+            let error = toml::from_str::<ClientConfig>(&text).unwrap_err();
+            assert!(error.to_string().contains("unknown field `server_nmae`"));
+        }
+    }
 
     #[test]
     fn lists_preserve_order_and_single_entry_compatibility() {
