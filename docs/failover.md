@@ -25,3 +25,14 @@ TLS certificate verification failures, capacity limits, opaque connector errors,
 ## Reverse proxy compatibility
 
 Multiple client peers cannot be combined with a nonempty `reverse_proxy`. Legacy singleton and single-entry list QUIC clients retain connection-owned reverse forwarding. AnyTLS reverse forwarding remains unsupported. TLS/TCP retains its existing behavior of ignoring reverse-proxy and QUIC transport settings. Relay mode rejects reverse control requests.
+
+## Verify failover
+
+On Linux with user/network namespaces and iproute2 available, run from the repository root:
+
+```sh
+cargo build --bins
+STUNNEL_BIN_DIR="$PWD/target/debug" python3 scripts/verify_failover.py --exhaustive
+```
+
+The script checks client and relay selection with separate peer credentials and destination markers. It covers TCP and UDP, failed setup, cooldown recovery, and established flows without replay. The exhaustive run includes two real 30-second cooldown waits. Run [the relay verification](relay.md#verify-the-route) separately to check the restricted-network topology and legacy reverse forwarding.
