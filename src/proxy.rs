@@ -34,8 +34,9 @@ where
     D: std::fmt::Display + Copy + Send + 'static,
 {
     let reverse = run_reverse_tunnels(opener.clone(), acceptor, reverse_tunnels);
-    let h = accept_http_tunnels(http_listener, &opener, id);
-    let s = accept_socks5_tunnels(socks5_listener, &opener, id);
+    let forward = crate::tunnel::upstream::ConnectionForward::new(opener);
+    let h = accept_http_tunnels(http_listener, &forward, id);
+    let s = accept_socks5_tunnels(socks5_listener, &forward, id);
 
     futures::try_join!(h, s, reverse).map(|_| ())
 }
@@ -46,7 +47,7 @@ pub async fn accept_http_tunnels<O, D>(
     id: D,
 ) -> std::io::Result<()>
 where
-    O: OpenTunnel,
+    O: crate::tunnel::upstream::SetupForward,
     D: std::fmt::Display + Copy + Send + 'static,
 {
     loop {
@@ -67,7 +68,7 @@ where
 
 async fn run_http_tunnel<O>(stream: TcpStream, opener: O) -> std::io::Result<()>
 where
-    O: OpenTunnel,
+    O: crate::tunnel::upstream::SetupForward,
 {
     let incoming = httpproxy::accept(stream).await?;
     let host = incoming.host().to_string();
@@ -97,7 +98,7 @@ pub async fn accept_socks5_tunnels<O, D>(
     id: D,
 ) -> std::io::Result<()>
 where
-    O: OpenTunnel,
+    O: crate::tunnel::upstream::SetupForward,
     D: std::fmt::Display + Copy + Send + 'static,
 {
     loop {
@@ -118,7 +119,7 @@ where
 
 async fn run_socks5_tunnel<O>(stream: TcpStream, opener: O) -> std::io::Result<()>
 where
-    O: OpenTunnel,
+    O: crate::tunnel::upstream::SetupForward,
 {
     match socks5::accept(stream).await? {
         AcceptResult::Connect(incoming) => {

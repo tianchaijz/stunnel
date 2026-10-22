@@ -114,7 +114,7 @@ async fn main() {
         }
     };
 
-    let route = match Forwarding::new(config.upstream.as_ref()) {
+    let route = match Forwarding::from_peers(&config.upstreams) {
         Ok(route) => route,
         Err(error) => {
             eprintln!("failed to configure upstream: {error}");

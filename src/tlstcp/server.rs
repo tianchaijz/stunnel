@@ -85,7 +85,7 @@ const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// Serve legacy TLS and optional AnyTLS on the main TCP address.
 /// At most 64 TLS handshakes run concurrently, independently of AnyTLS sessions.
 pub async fn serve(config: &crate::config::ServerConfig) -> std::io::Result<()> {
-    let route = Forwarding::new(config.upstream.as_ref())?;
+    let route = Forwarding::from_peers(&config.upstreams)?;
     serve_routed(config, route).await
 }
 

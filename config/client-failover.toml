@@ -1,0 +1,22 @@
+socks5_listen = "127.0.0.1:1080"
+http_listen = "127.0.0.1:8080"
+
+[[servers]]
+server_addr = "192.0.2.10:12345"
+server_name = "primary.example"
+server_cert = "primary-cert.pem"
+private_key = "primary-key.pem"
+tunnel_type = "quic"
+
+[servers.quic]
+cc = "bbr"
+
+[[servers]]
+server_addr = "192.0.2.20:12345"
+server_name = "backup.example"
+server_cert = "backup-cert.pem"
+private_key = "backup-key.pem"
+tunnel_type = "anytls"
+
+[servers.anytls]
+password = "replace-backup-secret"

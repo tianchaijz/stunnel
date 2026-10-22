@@ -105,3 +105,5 @@ opens streams on the same QUIC connection.
 ### Relay through another server
 
 A server can forward all TCP and UDP tunnels through another STunnel server using an optional `[upstream]` table. Both encrypted hops independently support TLS/TCP, AnyTLS, Quinn, and s2n-quic. See [the relay guide](docs/relay.md) and [sample relay configuration](config/relay.toml).
+
+Ordered forward failover is available through client `[[servers]]` and relay `[[upstreams]]` lists. Peers can use different transports and credentials. See [the failover reference](docs/failover.md) for deadlines, recovery, and reverse-proxy restrictions.

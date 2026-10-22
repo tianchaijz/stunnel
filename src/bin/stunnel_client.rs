@@ -2,42 +2,10 @@ use clap::Parser;
 use log::{error, info};
 use stunnel::{
     config::{self, ClientConfig, ReverseProxyConfig, TunnelType},
-    print_version, proxy, quic, tlstcp,
+    print_version, proxy, quic,
     tunnel::client::ReverseTunnel,
 };
 use tokio::net::TcpListener;
-
-async fn tlstcp_client(
-    config: ClientConfig,
-    http_listener: TcpListener,
-    socks5_listener: TcpListener,
-) -> std::io::Result<()> {
-    let tlstcp_config = tlstcp::client::Config {
-        server_addr: config.peer.server_addr,
-        server_name: config.peer.server_name,
-        cert: config.peer.server_cert,
-        priv_key: config.peer.private_key,
-    };
-
-    let connector = tlstcp::client::new(&tlstcp_config)?;
-    let h = proxy::accept_http_tunnels(&http_listener, &connector, "tlstcp");
-    let s = proxy::accept_socks5_tunnels(&socks5_listener, &connector, "tlstcp");
-
-    futures::try_join!(h, s).map(|_| ())
-}
-
-async fn anytls_client(
-    config: ClientConfig,
-    http_listener: TcpListener,
-    socks5_listener: TcpListener,
-) -> std::io::Result<()> {
-    let connector = stunnel::anytls::Connector::new(&config.peer)?;
-    futures::try_join!(
-        proxy::accept_http_tunnels(&http_listener, &connector, "anytls"),
-        proxy::accept_socks5_tunnels(&socks5_listener, &connector, "anytls"),
-    )
-    .map(|_| ())
-}
 
 async fn quinn_client(
     config: ClientConfig,
@@ -47,15 +15,18 @@ async fn quinn_client(
     let reverse_tunnels = build_reverse_tunnels(&config.reverse_proxy);
     let client_config = quic::Config {
         addr: "0.0.0.0:0".parse().unwrap(),
-        cert: config.peer.server_cert,
-        priv_key: config.peer.private_key,
-        transport: config.peer.quic,
+        cert: config.servers[0].server_cert.clone(),
+        priv_key: config.servers[0].private_key.clone(),
+        transport: config.servers[0].quic.clone(),
     };
 
     loop {
         let endpoint = quic::quinn::client::new(&client_config)?;
         let conn = endpoint
-            .connect(config.peer.server_addr, &config.peer.server_name)
+            .connect(
+                config.servers[0].server_addr,
+                &config.servers[0].server_name,
+            )
             .map_err(std::io::Error::other)?;
 
         match conn.await {
@@ -90,16 +61,16 @@ async fn s2n_client(
     let reverse_tunnels = build_reverse_tunnels(&config.reverse_proxy);
     let client_config = quic::Config {
         addr: "0.0.0.0:0".parse().unwrap(),
-        cert: config.peer.server_cert,
-        priv_key: config.peer.private_key,
-        transport: config.peer.quic,
+        cert: config.servers[0].server_cert.clone(),
+        priv_key: config.servers[0].private_key.clone(),
+        transport: config.servers[0].quic.clone(),
     };
 
     let endpoint = quic::s2n_quic::client::new(&client_config)?;
 
     loop {
-        let connect = s2n_quic::client::Connect::new(config.peer.server_addr)
-            .with_server_name(config.peer.server_name.clone());
+        let connect = s2n_quic::client::Connect::new(config.servers[0].server_addr)
+            .with_server_name(config.servers[0].server_name.clone());
 
         match endpoint.connect(connect).await {
             Ok(mut conn) => {
@@ -188,6 +159,23 @@ async fn main() {
         }
     };
 
+    let reverse = !config.reverse_proxy.is_empty()
+        && matches!(
+            config.servers[0].tunnel_type,
+            TunnelType::Quinn | TunnelType::S2nQuic
+        );
+    let route = if reverse {
+        None
+    } else {
+        match stunnel::tunnel::upstream::ForwardRoute::new(&config.servers) {
+            Ok(route) => Some(std::sync::Arc::new(route)),
+            Err(error) => {
+                eprintln!("failed to configure servers: {error}");
+                return;
+            }
+        }
+    };
+
     let socks5_listener = TcpListener::bind(&config.socks5_listen)
         .await
         .expect("socks5 bind error");
@@ -198,11 +186,18 @@ async fn main() {
     init_log(&config);
     info!("starting up");
 
-    let result = match config.peer.tunnel_type {
-        TunnelType::AnyTls => anytls_client(config, http_listener, socks5_listener).await,
-        TunnelType::TlsTcp => tlstcp_client(config, http_listener, socks5_listener).await,
-        TunnelType::Quinn => quinn_client(config, http_listener, socks5_listener).await,
-        TunnelType::S2nQuic => s2n_client(config, http_listener, socks5_listener).await,
+    let result = if let Some(route) = route {
+        futures::try_join!(
+            proxy::accept_http_tunnels(&http_listener, &route, "forward"),
+            proxy::accept_socks5_tunnels(&socks5_listener, &route, "forward"),
+        )
+        .map(|_| ())
+    } else {
+        match config.servers[0].tunnel_type {
+            TunnelType::Quinn => quinn_client(config, http_listener, socks5_listener).await,
+            TunnelType::S2nQuic => s2n_client(config, http_listener, socks5_listener).await,
+            _ => unreachable!("reverse ownership is only used by QUIC"),
+        }
     };
 
     if let Err(error) = result {

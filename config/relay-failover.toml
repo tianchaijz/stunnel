@@ -1,0 +1,26 @@
+listen = "0.0.0.0:12345"
+priv_key = "relay-key.pem"
+cert = "relay-cert.pem"
+
+[quic]
+server_type = "s2n-quic"
+
+[anytls]
+password = "replace-inbound-secret"
+
+[[upstreams]]
+server_addr = "192.0.2.30:12345"
+server_name = "primary-exit.example"
+server_cert = "primary-exit-cert.pem"
+private_key = "primary-exit-key.pem"
+tunnel_type = "tlstcp"
+
+[[upstreams]]
+server_addr = "192.0.2.40:12345"
+server_name = "backup-exit.example"
+server_cert = "backup-exit-cert.pem"
+private_key = "backup-exit-key.pem"
+tunnel_type = "s2n-quic"
+
+[upstreams.quic]
+cc = "bbr"

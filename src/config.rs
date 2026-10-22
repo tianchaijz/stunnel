@@ -36,11 +36,11 @@ pub struct ReverseProxyConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "RawClientConfig")]
 pub struct ClientConfig {
     pub socks5_listen: SocketAddr,
     pub http_listen: SocketAddr,
-    #[serde(flatten)]
-    pub peer: PeerConfig,
+    pub servers: Vec<PeerConfig>,
 
     #[serde(default)]
     pub reverse_proxy: Vec<ReverseProxyConfig>,
@@ -48,6 +48,47 @@ pub struct ClientConfig {
     #[cfg(target_os = "macos")]
     #[serde(default)]
     pub macos_logging: MacOsLogging,
+}
+
+#[derive(Deserialize)]
+struct RawClientConfig {
+    socks5_listen: SocketAddr,
+    http_listen: SocketAddr,
+    servers: Option<Vec<PeerConfig>>,
+    #[serde(default)]
+    reverse_proxy: Vec<ReverseProxyConfig>,
+    #[cfg(target_os = "macos")]
+    #[serde(default)]
+    macos_logging: MacOsLogging,
+    #[serde(flatten)]
+    legacy: toml::Table,
+}
+
+impl TryFrom<RawClientConfig> for ClientConfig {
+    type Error = String;
+    fn try_from(raw: RawClientConfig) -> Result<Self, Self::Error> {
+        let servers = match raw.servers {
+            Some(peers) if raw.legacy.is_empty() && !peers.is_empty() => peers,
+            Some(_) => {
+                return Err(
+                    "servers must be nonempty and cannot be mixed with flat peer fields".into(),
+                );
+            }
+            None => vec![
+                raw.legacy
+                    .try_into()
+                    .map_err(|e: toml::de::Error| e.to_string())?,
+            ],
+        };
+        Ok(Self {
+            socks5_listen: raw.socks5_listen,
+            http_listen: raw.http_listen,
+            servers,
+            reverse_proxy: raw.reverse_proxy,
+            #[cfg(target_os = "macos")]
+            macos_logging: raw.macos_logging,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,6 +109,8 @@ pub struct PeerConfig {
 impl PeerConfig {
     pub fn validate(&self) -> io::Result<()> {
         validate_non_empty(&self.server_name, "server_name")?;
+        rustls::pki_types::ServerName::try_from(self.server_name.as_str())
+            .map_err(|_| invalid_config("server_name is invalid"))?;
         if matches!(self.tunnel_type, TunnelType::Quinn | TunnelType::S2nQuic) {
             validate_quic(&self.quic)?;
         }
@@ -84,8 +127,18 @@ impl PeerConfig {
 
 impl ClientConfig {
     pub fn validate(&self) -> io::Result<()> {
-        self.peer.validate()?;
-        if self.peer.tunnel_type == TunnelType::AnyTls && !self.reverse_proxy.is_empty() {
+        if self.servers.is_empty() {
+            return Err(invalid_config("servers must not be empty"));
+        }
+        for peer in &self.servers {
+            peer.validate()?;
+        }
+        if self.servers.len() > 1 && !self.reverse_proxy.is_empty() {
+            return Err(invalid_config(
+                "multiple servers do not support reverse_proxy",
+            ));
+        }
+        if self.servers[0].tunnel_type == TunnelType::AnyTls && !self.reverse_proxy.is_empty() {
             return Err(invalid_config("anytls does not support reverse_proxy"));
         }
 
@@ -107,8 +160,9 @@ pub struct ServerQuicConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "RawServerConfig")]
 pub struct ServerConfig {
-    pub upstream: Option<PeerConfig>,
+    pub upstreams: Vec<PeerConfig>,
 
     pub listen: SocketAddr,
     pub priv_key: PathBuf,
@@ -120,12 +174,44 @@ pub struct ServerConfig {
     pub quic: ServerQuicConfig,
 }
 
+#[derive(Deserialize)]
+struct RawServerConfig {
+    upstream: Option<PeerConfig>,
+    upstreams: Option<Vec<PeerConfig>>,
+    listen: SocketAddr,
+    priv_key: PathBuf,
+    cert: PathBuf,
+    anytls: Option<ServerAnyTlsConfig>,
+    #[serde(default)]
+    quic: ServerQuicConfig,
+}
+
+impl TryFrom<RawServerConfig> for ServerConfig {
+    type Error = &'static str;
+    fn try_from(raw: RawServerConfig) -> Result<Self, Self::Error> {
+        let upstreams = match (raw.upstream, raw.upstreams) {
+            (Some(_), Some(_)) => return Err("upstream and upstreams cannot be mixed"),
+            (None, Some(peers)) if peers.is_empty() => return Err("upstreams must not be empty"),
+            (None, Some(peers)) => peers,
+            (peer, None) => peer.into_iter().collect(),
+        };
+        Ok(Self {
+            upstreams,
+            listen: raw.listen,
+            priv_key: raw.priv_key,
+            cert: raw.cert,
+            anytls: raw.anytls,
+            quic: raw.quic,
+        })
+    }
+}
+
 impl ServerConfig {
     pub fn validate(&self) -> io::Result<()> {
         if let Some(anytls) = &self.anytls {
             validate_non_empty(&anytls.password, "anytls.password")?;
         }
-        if let Some(peer) = &self.upstream {
+        for peer in &self.upstreams {
             peer.validate()?;
             let listen = self.listen;
             let target = peer.server_addr;
@@ -273,7 +359,7 @@ mod tests {
         let config = ClientConfig {
             socks5_listen: "127.0.0.1:1080".parse().unwrap(),
             http_listen: "127.0.0.1:8080".parse().unwrap(),
-            peer: crate::config::PeerConfig {
+            servers: vec![crate::config::PeerConfig {
                 server_addr: "127.0.0.1:12345".parse().unwrap(),
                 server_name: "stunnel".to_string(),
                 server_cert: PathBuf::new(),
@@ -285,7 +371,7 @@ mod tests {
                     loss_threshold: 0,
                     fixed_bandwidth: 0,
                 },
-            },
+            }],
             reverse_proxy: vec![ReverseProxyConfig {
                 listen: "127.0.0.1:8081".parse().unwrap(),
                 target: "127.0.0.1:3000".parse().unwrap(),
@@ -308,7 +394,7 @@ mod relay_tests {
     #[test]
     fn existing_client_tables_remain_flattened() {
         let client: ClientConfig = toml::from_str(&format!("socks5_listen='127.0.0.1:1080'\nhttp_listen='127.0.0.1:8080'\n{PEER}\n[quic]\ncc='bbr'\n")).unwrap();
-        assert_eq!(client.peer.server_name, "exit");
+        assert_eq!(client.servers[0].server_name, "exit");
         assert!(client.validate().is_ok());
     }
 
@@ -359,5 +445,102 @@ mod relay_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod failover_tests {
+    use super::*;
+    const CLIENT: &str = "socks5_listen='127.0.0.1:1080'\nhttp_listen='127.0.0.1:8080'\n";
+    const SERVER: &str = "listen='127.0.0.1:443'\npriv_key='key.pem'\ncert='cert.pem'\n";
+    const PEER: &str = "server_addr='127.0.0.1:444'\nserver_name='exit'\nserver_cert='exit.pem'\nprivate_key='exit.key'\ntunnel_type='quic'\n";
+
+    #[test]
+    fn lists_preserve_order_and_single_entry_compatibility() {
+        for count in [1, 2] {
+            let peers = (0..count)
+                .map(|i| {
+                    format!(
+                        "[[servers]]\n{}",
+                        PEER.replace("444", &(444 + i).to_string())
+                    )
+                })
+                .collect::<String>();
+            let client: ClientConfig = toml::from_str(&format!("{CLIENT}{peers}")).unwrap();
+            client.validate().unwrap();
+            assert_eq!(client.servers.len(), count as usize);
+            assert_eq!(
+                client.servers.last().unwrap().server_addr.port(),
+                443 + count
+            );
+            let server: ServerConfig = toml::from_str(&format!(
+                "{SERVER}{}",
+                peers.replace("servers", "upstreams")
+            ))
+            .unwrap();
+            server.validate().unwrap();
+            assert_eq!(server.upstreams.len(), count as usize);
+        }
+        let direct: ServerConfig = toml::from_str(SERVER).unwrap();
+        assert!(direct.upstreams.is_empty());
+    }
+
+    #[test]
+    fn empty_mixed_and_incomplete_forms_are_rejected() {
+        for text in [
+            format!("{CLIENT}servers=[]\n"),
+            format!("{CLIENT}{PEER}[[servers]]\n{PEER}"),
+            format!("{CLIENT}server_name='partial'\n[[servers]]\n{PEER}"),
+            format!("{CLIENT}[[servers]]\n{PEER}[[servers]]\nserver_name='incomplete'\n"),
+        ] {
+            assert!(toml::from_str::<ClientConfig>(&text).is_err());
+        }
+        for text in [
+            format!("{SERVER}upstreams=[]\n"),
+            format!("{SERVER}[upstream]\n{PEER}[[upstreams]]\n{PEER}"),
+            format!("{SERVER}[upstream]\nserver_name='partial'\n[[upstreams]]\n{PEER}"),
+            format!("{SERVER}[[upstreams]]\n{PEER}[[upstreams]]\nserver_name='incomplete'\n"),
+        ] {
+            assert!(toml::from_str::<ServerConfig>(&text).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_backup_options_authentication_and_self_loops_are_rejected() {
+        for backup in [
+            format!("{PEER}[servers.quic]\nloss_threshold=0\n"),
+            PEER.replace("quic", "anytls"),
+            format!(
+                "{}[servers.anytls]\npassword=''\n",
+                PEER.replace("quic", "anytls")
+            ),
+        ] {
+            let client: ClientConfig =
+                toml::from_str(&format!("{CLIENT}[[servers]]\n{PEER}[[servers]]\n{backup}"))
+                    .unwrap();
+            assert!(client.validate().is_err());
+        }
+        let server: ServerConfig = toml::from_str(&format!(
+            "{SERVER}[[upstreams]]\n{PEER}[[upstreams]]\n{}",
+            PEER.replace("444", "443")
+        ))
+        .unwrap();
+        assert!(server.validate().is_err());
+        assert!(
+            toml::from_str::<ClientConfig>(&format!(
+                "{CLIENT}[[servers]]\n{PEER}[[servers]]\n{PEER}typo=true\n"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn multiple_reverse_peers_are_rejected_but_single_list_is_supported() {
+        let reverse = "reverse_proxy=[{listen='127.0.0.1:5000',target='127.0.0.1:5001'}]\n";
+        let mut client: ClientConfig =
+            toml::from_str(&format!("{CLIENT}{reverse}[[servers]]\n{PEER}")).unwrap();
+        client.validate().unwrap();
+        client.servers.push(client.servers[0].clone());
+        assert!(client.validate().is_err());
     }
 }

@@ -4,10 +4,7 @@ use log::{error, info};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 use tokio::net::TcpStream;
 
-use crate::tunnel::{
-    AcceptTunnel, ControlReply, OpenTunnel, TYPE_CONTROL, TYPE_TCP_FWD, TYPE_TCP_REV, TYPE_UDP_FWD,
-    Tunnel,
-};
+use crate::tunnel::{AcceptTunnel, ControlReply, OpenTunnel, TYPE_CONTROL, TYPE_TCP_REV, Tunnel};
 
 #[derive(Clone)]
 pub struct ReverseTunnel {
@@ -15,35 +12,29 @@ pub struct ReverseTunnel {
     pub target: SocketAddr,
 }
 
-pub async fn connect_tcp_tunnel<O>(
+pub async fn connect_tcp_tunnel<O: super::upstream::SetupForward>(
     mut opener: O,
     target: &str,
-) -> std::io::Result<(SocketAddr, Tunnel<O::S, O::R>)>
-where
-    O: OpenTunnel,
-{
-    let mut tun = opener.open_tunnel().await?;
-
-    tun.write_u8(TYPE_TCP_FWD).await?;
-    tun.write_str8(target).await?;
-
-    let (_, bind) = super::protocol::read_bind(&mut tun).await?;
-
-    Ok((bind, tun))
+) -> std::io::Result<(SocketAddr, Tunnel<O::S, O::R>)> {
+    let bound = opener
+        .setup(
+            &super::upstream::ForwardRequest::Tcp(target.into()),
+            tokio::time::Instant::now() + super::upstream::RELAY_SETUP_TIMEOUT,
+        )
+        .await?;
+    Ok((bound.bind.socket_addr(), bound.tunnel))
 }
 
-pub async fn connect_udp_tunnel<O>(mut opener: O) -> std::io::Result<Tunnel<O::S, O::R>>
-where
-    O: OpenTunnel,
-{
-    let mut tun = opener.open_tunnel().await?;
-
-    tun.write_u8(TYPE_UDP_FWD).await?;
-
-    // server responds with its udp socket bind addr, not used by the caller
-    super::protocol::read_bind(&mut tun).await?;
-
-    Ok(tun)
+pub async fn connect_udp_tunnel<O: super::upstream::SetupForward>(
+    mut opener: O,
+) -> std::io::Result<Tunnel<O::S, O::R>> {
+    Ok(opener
+        .setup(
+            &super::upstream::ForwardRequest::Udp,
+            tokio::time::Instant::now() + super::upstream::RELAY_SETUP_TIMEOUT,
+        )
+        .await?
+        .tunnel)
 }
 
 // Runs the reverse side of one multiplexed connection: registers the

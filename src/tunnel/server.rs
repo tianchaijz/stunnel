@@ -11,7 +11,7 @@ use crate::tunnel::{
     TYPE_TCP_REV, TYPE_UDP_FWD, Tunnel,
 };
 
-use super::upstream::{Forwarding, RelayAdmission, Upstream};
+use super::upstream::{ForwardRequest, Forwarding, RelayAdmission, Upstream};
 
 pub async fn handle_routed_tunnels<O, A>(
     opener: O,
@@ -82,28 +82,14 @@ where
                     ));
                 }
             };
-            let (recv, send) = tokio::io::split(upstream.open().await?);
-            let mut outbound = Tunnel::new(send, recv);
-            match request {
-                ForwardRequest::Tcp(destination) => {
-                    outbound.write_u8(TYPE_TCP_FWD).await?;
-                    outbound.write_str8(&destination).await?;
-                }
-                ForwardRequest::Udp => outbound.write_u8(TYPE_UDP_FWD).await?,
-            }
-            outbound.flush().await?;
-            let (bind, _) = super::protocol::read_bind(&mut outbound).await?;
-            downstream.write_str8(&bind).await?;
+            let bound = upstream.setup(&request, admission.deadline).await?;
+            bound.bind.write_to(&mut downstream).await?;
+            let outbound = bound.tunnel;
             downstream.flush().await?;
             Ok::<_, std::io::Error>((downstream, outbound))
         })
         .await?;
     copy_bidirectional(&mut downstream, &mut outbound).await
-}
-
-enum ForwardRequest {
-    Tcp(String),
-    Udp,
 }
 
 enum Incoming<S, R> {

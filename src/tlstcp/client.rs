@@ -17,16 +17,16 @@ pub struct Config {
 pub struct Connector {
     connector: TlsConnector,
     server_addr: SocketAddr,
-    server_name: String,
+    server_name: ServerName<'static>,
 }
 
 impl Connector {
     pub async fn connect(&self) -> std::io::Result<TlsStream> {
         let stream = TcpStream::connect(&self.server_addr).await?;
-        let domain = ServerName::try_from(self.server_name.as_str())
-            .map_err(std::io::Error::other)?
-            .to_owned();
-        let stream = self.connector.connect(domain, stream).await?;
+        let stream = self
+            .connector
+            .connect(self.server_name.clone(), stream)
+            .await?;
         Ok(TlsStream::Client(stream))
     }
 }
@@ -52,6 +52,6 @@ fn new_client(config: &Config) -> Result<Connector, Box<dyn Error + Send + Sync>
     Ok(Connector {
         connector: TlsConnector::from(Arc::new(client_config)),
         server_addr: config.server_addr,
-        server_name: config.server_name.clone(),
+        server_name: ServerName::try_from(config.server_name.clone())?,
     })
 }
