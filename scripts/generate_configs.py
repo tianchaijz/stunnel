@@ -112,7 +112,8 @@ def parse_options(argv: Sequence[str]) -> Options:
     if not output.parent.is_dir():
         parser.error('output parent must be an existing directory')
     root = Path(__file__).resolve().parents[1]
-    candidates = [args.certgen] if args.certgen else [str(root / 'target/release/certgen'),
+    candidates = [args.certgen] if args.certgen else [str(Path(__file__).resolve().with_name('certgen')),
+                                                     str(root / 'target/release/certgen'),
                                                      str(root / 'target/debug/certgen')]
     binary = next((shutil.which(value) for value in candidates if shutil.which(value)), None)
     if binary is None:
