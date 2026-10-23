@@ -8,18 +8,20 @@ server_type = "s2n-quic"
 [anytls]
 password = "replace-inbound-secret"
 
+# Upstreams are tried in order; established connections stay on the selected one.
+# Each server_name must match that upstream's TLS certificate.
 [[upstreams]]
 server_addr = "192.0.2.30:12345"
-server_name = "primary-exit.example"
-server_cert = "primary-exit-cert.pem"
-private_key = "primary-exit-key.pem"
+server_name = "primary.example"
+server_cert = "primary-cert.pem"
+private_key = "primary-key.pem"
 tunnel_type = "tlstcp"
 
 [[upstreams]]
 server_addr = "192.0.2.40:12345"
-server_name = "backup-exit.example"
-server_cert = "backup-exit-cert.pem"
-private_key = "backup-exit-key.pem"
+server_name = "backup.example"
+server_cert = "backup-cert.pem"
+private_key = "backup-key.pem"
 tunnel_type = "s2n-quic"
 
 [upstreams.quic]
