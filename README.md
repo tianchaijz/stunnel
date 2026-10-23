@@ -34,6 +34,8 @@ Simple SOCKS5/HTTP tunnel. SOCKS5 on client side provides NO AUTHENTICATION TCP/
 
 ## Usage
 
+To create portable client, relay, and server bundles with certificates, use the [deployment config generator](docs/generate-configs.md).
+
 1. `./certgen` generates cert and private key
 2. modify `config/client.toml` and `config/server.toml`
 3. start server(`./stunnel_server --config config/server.toml`) and client(`./stunnel_client --config config/client.toml`) with the same cert
