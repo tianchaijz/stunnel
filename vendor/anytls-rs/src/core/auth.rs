@@ -87,6 +87,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn round_trips_maximum_padding_length() {
+        for range in ["65535-65535", "65535-65536"] {
+            let raw = format!("stop=8\n0={range}");
+            let padding = crate::PaddingFactory::new(raw.as_bytes()).unwrap();
+            let mut bytes = Vec::new();
+            write_auth(&mut bytes, "password", &padding).await.unwrap();
+            assert_eq!(u16::from_be_bytes([bytes[32], bytes[33]]), u16::MAX);
+            assert_eq!(bytes.len(), AUTH_HEADER_SIZE + usize::from(u16::MAX));
+            let mut reader = bytes.as_slice();
+            read_auth(&mut reader, "password").await.unwrap();
+            assert!(reader.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn rejects_wrong_password() {
         let padding = crate::PaddingFactory::new(DEFAULT_SCHEME).unwrap();
         let mut bytes = Vec::new();

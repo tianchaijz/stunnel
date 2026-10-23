@@ -2329,6 +2329,88 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_padding_updates_preserve_scheme_and_stream_traffic() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (local, mut peer) = tokio::io::duplex(128 * 1024);
+            let original = PaddingFactory::new(b"stop=100\n1=32-32\n2=32-32").unwrap();
+            let padding = Arc::new(RwLock::new(original.clone()));
+            let session = Session::new_client(1, Box::new(local), Arc::clone(&padding), DEFAULT_MAX_SESSION_AGE);
+            session.run().await.unwrap();
+            let stream = session.open_stream().await.unwrap();
+            loop {
+                if Frame::read_from(&mut peer).await.unwrap().command == Command::Syn {
+                    break;
+                }
+            }
+            for raw in [
+                b"stop=100\n2=2147483648-2147483648".as_slice(),
+                b"stop=100\n2=65536-65536",
+                b"stop=100\n2=32765-32765,32765-32765",
+                b"stop=100\n2=invalid",
+            ] {
+                let mut update = Frame::new(Command::UpdatePaddingScheme, 0);
+                update.data = raw.to_vec();
+                peer.write_all(&update.encode().unwrap()).await.unwrap();
+                peer.write_all(&Frame::new(Command::HeartRequest, 0).encode().unwrap())
+                    .await
+                    .unwrap();
+                loop {
+                    if Frame::read_from(&mut peer).await.unwrap().command == Command::HeartResponse {
+                        break;
+                    }
+                }
+                assert_eq!(*padding.read().await, original);
+            }
+            assert_eq!(stream.write(b"hello").await.unwrap(), 5);
+            let outgoing = loop {
+                let frame = Frame::read_from(&mut peer).await.unwrap();
+                if frame.command != Command::Waste {
+                    break frame;
+                }
+            };
+            assert_eq!(outgoing.command, Command::Push);
+            assert_eq!(outgoing.stream_id, stream.id());
+            assert_eq!(outgoing.data, b"hello");
+            let mut incoming = Frame::new(Command::Push, stream.id());
+            incoming.data = b"world".to_vec();
+            peer.write_all(&incoming.encode().unwrap()).await.unwrap();
+            let mut received = [0; 5];
+            assert_eq!(stream.read(&mut received).await.unwrap(), 5);
+            assert_eq!(&received, b"world");
+            assert!(!session.is_closed());
+            session.shutdown().await.unwrap();
+        })
+        .await
+        .expect("invalid padding must not interrupt the heartbeat or stream traffic");
+    }
+
+    #[tokio::test]
+    async fn maximum_padding_waste_frames_preserve_wire_lengths() {
+        for range in ["65535-65535", "65535-65536"] {
+            let (local, mut peer) = tokio::io::duplex(128 * 1024);
+            let (_, transport) = tokio::io::split(Box::new(local) as BoxTransport);
+            let mut writer = Writer {
+                transport,
+                buffering: false,
+                buffered: Vec::new(),
+                send_padding: true,
+                packet_counter: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            };
+            let raw = format!("stop=8\n1={range}");
+            let padding = Arc::new(RwLock::new(PaddingFactory::new(raw.as_bytes()).unwrap()));
+            writer.write_conn(Vec::new(), &padding).await.unwrap();
+            writer
+                .write_conn(Frame::new(Command::HeartRequest, 0).encode().unwrap(), &padding)
+                .await
+                .unwrap();
+            let waste = Frame::read_from(&mut peer).await.unwrap();
+            assert_eq!(waste.command, Command::Waste);
+            assert_eq!(waste.data.len(), usize::from(u16::MAX));
+            assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::HeartRequest);
+        }
+    }
+
+    #[tokio::test]
     async fn exchanges_settings_syn_data_and_synack() {
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
         let client = Session::new_client(11, Box::new(client_io), padding(), DEFAULT_MAX_SESSION_AGE);
