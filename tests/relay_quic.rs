@@ -259,3 +259,146 @@ async fn quinn_relay_reuses_connections_and_recovers_after_close() {
 async fn s2n_relay_reuses_connections_and_recovers_after_close() {
     cache_scenario(TunnelType::S2nQuic).await;
 }
+
+#[derive(Default)]
+struct Recorded {
+    established: std::sync::atomic::AtomicU64,
+    active: std::sync::Mutex<f64>,
+    durations: std::sync::atomic::AtomicU64,
+}
+impl metrics::CounterFn for Recorded {
+    fn increment(&self, value: u64) {
+        self.established.fetch_add(value, Ordering::SeqCst);
+    }
+    fn absolute(&self, value: u64) {
+        self.established.store(value, Ordering::SeqCst);
+    }
+}
+impl metrics::GaugeFn for Recorded {
+    fn increment(&self, value: f64) {
+        *self.active.lock().unwrap() += value;
+    }
+    fn decrement(&self, value: f64) {
+        *self.active.lock().unwrap() -= value;
+    }
+    fn set(&self, value: f64) {
+        *self.active.lock().unwrap() = value;
+    }
+}
+impl metrics::HistogramFn for Recorded {
+    fn record(&self, _: f64) {
+        self.durations.fetch_add(1, Ordering::SeqCst);
+    }
+}
+#[derive(Default)]
+struct Recorder(std::sync::Arc<Recorded>);
+impl metrics::Recorder for Recorder {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        if key.name() == stunnel::metrics::TRANSPORT_CONNECTIONS {
+            metrics::Counter::from_arc(self.0.clone())
+        } else {
+            metrics::Counter::noop()
+        }
+    }
+    fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        if key.name() == stunnel::metrics::TRANSPORT_ACTIVE_CONNECTIONS {
+            metrics::Gauge::from_arc(self.0.clone())
+        } else {
+            metrics::Gauge::noop()
+        }
+    }
+    fn register_histogram(
+        &self,
+        key: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        if key.name() == stunnel::metrics::TRANSPORT_CONNECTION_DURATION {
+            metrics::Histogram::from_arc(self.0.clone())
+        } else {
+            metrics::Histogram::noop()
+        }
+    }
+}
+
+#[test]
+fn transport_metrics_follow_cached_connections_and_cancelled_owners() {
+    for backend in [TunnelType::Quinn, TunnelType::S2nQuic] {
+        let recorder = Recorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(20), async {
+                        let mut exit = Exit::new(backend).await;
+                        for _ in 0..3 {
+                            echo(exit.route.clone(), b"reuse".to_vec()).await;
+                        }
+                        assert_eq!(recorder.0.established.load(Ordering::SeqCst), 1);
+                        assert_eq!(*recorder.0.active.lock().unwrap(), 1.0);
+                        let close = exit.connections.recv().await.unwrap();
+                        close.send(()).unwrap();
+                        while *recorder.0.active.lock().unwrap() != 0.0 {
+                            tokio::task::yield_now().await;
+                        }
+                        assert_eq!(recorder.0.durations.load(Ordering::SeqCst), 1);
+                        echo(exit.route.clone(), b"reconnect".to_vec()).await;
+                        assert_eq!(recorder.0.established.load(Ordering::SeqCst), 2);
+                        assert_eq!(*recorder.0.active.lock().unwrap(), 1.0);
+                        drop(exit);
+                        while *recorder.0.active.lock().unwrap() != 0.0 {
+                            tokio::task::yield_now().await;
+                        }
+                        assert_eq!(recorder.0.durations.load(Ordering::SeqCst), 2);
+                    })
+                    .await
+                    .unwrap();
+                });
+        });
+    }
+}
+
+#[test]
+fn cancelled_transport_task_records_completion_once() {
+    let recorder = Recorder::default();
+    metrics::with_local_recorder(&recorder, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let connection = stunnel::metrics::TransportConnection::established("tlstcp");
+                let task = tokio::spawn(async move {
+                    let _connection = connection;
+                    std::future::pending::<()>().await;
+                });
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+                assert_eq!(recorder.0.established.load(Ordering::SeqCst), 1);
+                assert_eq!(*recorder.0.active.lock().unwrap(), 0.0);
+                assert_eq!(recorder.0.durations.load(Ordering::SeqCst), 1);
+            });
+    });
+}

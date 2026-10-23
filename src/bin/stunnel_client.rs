@@ -2,8 +2,11 @@ use clap::Parser;
 use log::{error, info};
 use stunnel::{
     config::{self, ClientConfig, ReverseProxyConfig, TunnelType},
+    metrics::{TRANSPORT_CONNECTIONS, TransportConnection},
     print_version, proxy, quic,
+    telemetry::Telemetry,
     tunnel::client::ReverseTunnel,
+    version,
 };
 use tokio::net::TcpListener;
 
@@ -32,6 +35,8 @@ async fn quinn_client(
         match conn.await {
             Ok(conn) => {
                 let id = conn.stable_id();
+                let _connection = TransportConnection::established("quic");
+
                 proxy::run_all_kinds_tunnels(
                     conn.clone(),
                     conn,
@@ -47,6 +52,12 @@ async fn quinn_client(
                 .ok();
             }
             Err(error) => {
+                metrics::counter!(
+                    TRANSPORT_CONNECTIONS,
+                    "transport" => "quic",
+                    "outcome" => "error",
+                )
+                .increment(1);
                 error!("quic connect error: {error}");
             }
         }
@@ -76,6 +87,8 @@ async fn s2n_client(
             Ok(mut conn) => {
                 if conn.keep_alive(true).is_ok() {
                     let id = conn.id();
+                    let _connection = TransportConnection::established("s2n-quic");
+
                     let (opener, acceptor) = conn.split();
                     proxy::run_all_kinds_tunnels(
                         opener,
@@ -93,6 +106,12 @@ async fn s2n_client(
                 }
             }
             Err(error) => {
+                metrics::counter!(
+                    TRANSPORT_CONNECTIONS,
+                    "transport" => "s2n-quic",
+                    "outcome" => "error",
+                )
+                .increment(1);
                 error!("quic connect error: {error}");
             }
         }
@@ -185,6 +204,14 @@ async fn main() {
 
     init_log(&config);
     info!("starting up");
+
+    let _telemetry = match Telemetry::init(&config.otel, &version("stunnel_client")) {
+        Ok(telemetry) => telemetry,
+        Err(error) => {
+            eprintln!("failed to start metrics: {error}");
+            return;
+        }
+    };
 
     let result = if let Some(route) = route {
         futures::try_join!(

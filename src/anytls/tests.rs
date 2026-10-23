@@ -49,6 +49,7 @@ impl Fixture {
         )
         .unwrap();
         let config = ClientConfig {
+            otel: crate::telemetry::OtelConfig::default(),
             socks5_listen: "127.0.0.1:0".parse().unwrap(),
             http_listen: "127.0.0.1:0".parse().unwrap(),
             servers: vec![crate::config::PeerConfig {
@@ -473,6 +474,7 @@ async fn cancelled_public_server_closes_authenticated_and_legacy_transports() {
     fixture.server.abort();
     assert!((&mut fixture.server).await.unwrap_err().is_cancelled());
     let config = ServerConfig {
+        otel: crate::telemetry::OtelConfig::default(),
         upstreams: vec![],
         listen: fixture.config.servers[0].server_addr,
         cert: fixture.config.servers[0].server_cert.clone(),
@@ -1174,6 +1176,7 @@ async fn public_server_uses_configured_upstream() {
     relay.server.abort();
     assert!((&mut relay.server).await.unwrap_err().is_cancelled());
     let config = ServerConfig {
+        otel: crate::telemetry::OtelConfig::default(),
         upstreams: vec![exit.config.servers[0].clone()],
         listen: relay.config.servers[0].server_addr,
         cert: relay.config.servers[0].server_cert.clone(),

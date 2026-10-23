@@ -142,6 +142,7 @@ pub(crate) async fn serve_listener(
                         let result = if protocol.as_deref() == Some(crate::anytls::ALPN) {
                             anytls.as_ref().expect("advertised AnyTLS must be enabled").accept(stream, deadline, route).await
                         } else {
+                            let _connection = crate::metrics::TransportConnection::established("tlstcp");
                             let (reader, writer) = super::split(TlsStream::Server(stream));
                             crate::tunnel::server::handle_routed_forward(writer, reader, &route).await.map(|_| ())
                         };

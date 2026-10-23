@@ -2,6 +2,7 @@ mod tls;
 
 use crate::{
     config::PeerConfig,
+    metrics::TransportConnection,
     tunnel::{OpenTunnel, Tunnel, transport::OwnedIo, upstream::Forwarding},
 };
 use anytls_protocol::{
@@ -74,15 +75,22 @@ impl Connector {
                 let permit = slots.try_acquire_owned().map_err(|_| {
                     io::Error::new(io::ErrorKind::WouldBlock, "AnyTLS session capacity reached")
                 })?;
-                let tcp = TcpStream::connect(address).await?;
-                tcp.set_nodelay(true)?;
-                let mut stream = connector.connect(name, tcp).await?;
-                check_alpn(stream.get_ref().1.alpn_protocol())?;
-                let padding = padding.read().await.clone();
-                write_auth(&mut stream, &password, &padding).await?;
+                let result = async {
+                    let tcp = TcpStream::connect(address).await?;
+                    tcp.set_nodelay(true)?;
+                    let mut stream = connector.connect(name, tcp).await?;
+                    check_alpn(stream.get_ref().1.alpn_protocol())?;
+                    let padding = padding.read().await.clone();
+                    write_auth(&mut stream, &password, &padding).await?;
+                    Ok::<_, io::Error>(stream)
+                }
+                .await;
+                let stream = result.inspect_err(|_| {
+                    TransportConnection::failed("anytls");
+                })?;
                 Ok(Box::new(OwnedIo {
                     stream,
-                    _owner: permit,
+                    _owner: (permit, TransportConnection::established("anytls")),
                 }) as BoxTransport)
             })
         });
@@ -162,7 +170,7 @@ impl Server {
         server_session(
             OwnedIo {
                 stream,
-                _owner: permit,
+                _owner: (permit, TransportConnection::established("anytls")),
             },
             sequence,
             route,

@@ -7,6 +7,7 @@ use std::{
 use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::quic::{CongestionControl, QuicConfig};
+use crate::telemetry::OtelConfig;
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 pub enum TunnelType {
@@ -41,6 +42,7 @@ pub struct ClientConfig {
     pub socks5_listen: SocketAddr,
     pub http_listen: SocketAddr,
     pub servers: Vec<PeerConfig>,
+    pub otel: OtelConfig,
 
     #[serde(default)]
     pub reverse_proxy: Vec<ReverseProxyConfig>,
@@ -55,6 +57,8 @@ struct RawClientConfig {
     socks5_listen: SocketAddr,
     http_listen: SocketAddr,
     servers: Option<Vec<PeerConfig>>,
+    #[serde(default = "client_otel")]
+    otel: OtelConfig,
     #[serde(default)]
     reverse_proxy: Vec<ReverseProxyConfig>,
     #[cfg(target_os = "macos")]
@@ -87,6 +91,7 @@ impl TryFrom<RawClientConfig> for ClientConfig {
             socks5_listen: raw.socks5_listen,
             http_listen: raw.http_listen,
             servers,
+            otel: raw.otel,
             reverse_proxy: raw.reverse_proxy,
             #[cfg(target_os = "macos")]
             macos_logging: raw.macos_logging,
@@ -175,6 +180,9 @@ pub struct ServerConfig {
 
     #[serde(default)]
     pub quic: ServerQuicConfig,
+
+    #[serde(default = "server_otel")]
+    pub otel: OtelConfig,
 }
 
 #[derive(Deserialize)]
@@ -187,6 +195,8 @@ struct RawServerConfig {
     anytls: Option<ServerAnyTlsConfig>,
     #[serde(default)]
     quic: ServerQuicConfig,
+    #[serde(default = "server_otel")]
+    otel: OtelConfig,
 }
 
 impl TryFrom<RawServerConfig> for ServerConfig {
@@ -205,6 +215,7 @@ impl TryFrom<RawServerConfig> for ServerConfig {
             cert: raw.cert,
             anytls: raw.anytls,
             quic: raw.quic,
+            otel: raw.otel,
         })
     }
 }
@@ -326,6 +337,16 @@ fn invalid_config(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
+// The two binaries report under their own service name, so one dashboard can
+// be read against either end without editing the config.
+fn client_otel() -> OtelConfig {
+    OtelConfig::for_service("stunnel-client")
+}
+
+fn server_otel() -> OtelConfig {
+    OtelConfig::for_service("stunnel-server")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,6 +381,7 @@ mod tests {
     #[test]
     fn tls_tcp_ignores_quic_and_reverse_proxy_config() {
         let config = ClientConfig {
+            otel: client_otel(),
             socks5_listen: "127.0.0.1:1080".parse().unwrap(),
             http_listen: "127.0.0.1:8080".parse().unwrap(),
             servers: vec![crate::config::PeerConfig {
@@ -385,6 +407,53 @@ mod tests {
         };
 
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn each_binary_defaults_to_its_own_service_name() {
+        let client: ClientConfig = toml::from_str(
+            r#"
+                socks5_listen = "127.0.0.1:1080"
+                http_listen = "127.0.0.1:8080"
+                server_addr = "127.0.0.1:12345"
+                server_name = "stunnel"
+                server_cert = "cert.pem"
+                private_key = "key.pem"
+                tunnel_type = "tlstcp"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(client.otel.service_name, "stunnel-client");
+
+        let server: ServerConfig = toml::from_str(
+            r#"
+                listen = "127.0.0.1:12345"
+                priv_key = "key.pem"
+                cert = "cert.pem"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(server.otel.service_name, "stunnel-server");
+
+        // A config that names the service wins over the default.
+        let client: ClientConfig = toml::from_str(
+            r#"
+                socks5_listen = "127.0.0.1:1080"
+                http_listen = "127.0.0.1:8080"
+                server_addr = "127.0.0.1:12345"
+                server_name = "stunnel"
+                server_cert = "cert.pem"
+                private_key = "key.pem"
+                tunnel_type = "tlstcp"
+                otel = { endpoint = "http://127.0.0.1:4318", service_name = "stunnel-a" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(client.otel.service_name, "stunnel-a");
+        assert_eq!(
+            client.otel.resolved_endpoint().as_deref(),
+            Some("http://127.0.0.1:4318")
+        );
     }
 }
 
@@ -491,6 +560,35 @@ mod failover_tests {
             );
             let error = toml::from_str::<ClientConfig>(&text).unwrap_err();
             assert!(error.to_string().contains("unknown field `server_nmae`"));
+        }
+    }
+
+    #[test]
+    fn otel_is_process_config_for_flat_and_list_peers() {
+        for prefix in ["", "[[servers]]\n"] {
+            let text = format!(
+                "{CLIENT}otel={{endpoint='http://localhost:4318',service_name='edge'}}\n{prefix}{PEER}"
+            );
+            let client: ClientConfig = toml::from_str(&text).unwrap();
+            assert_eq!(client.otel.service_name, "edge");
+            assert_eq!(
+                client.otel.endpoint.as_deref(),
+                Some("http://localhost:4318")
+            );
+            assert_eq!(client.servers.len(), 1);
+            assert!(
+                toml::from_str::<ClientConfig>(&format!("{text}server_nmae='typo'\n")).is_err()
+            );
+        }
+        for upstream in ["", "[upstream]\n", "[[upstreams]]\n"] {
+            let peers = if upstream.is_empty() {
+                String::new()
+            } else {
+                format!("{upstream}{PEER}")
+            };
+            let server: ServerConfig =
+                toml::from_str(&format!("{SERVER}otel={{service_name='relay'}}\n{peers}")).unwrap();
+            assert_eq!(server.otel.service_name, "relay");
         }
     }
 

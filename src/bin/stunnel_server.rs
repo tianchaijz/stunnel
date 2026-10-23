@@ -4,8 +4,12 @@ use quinn::Connection;
 use stunnel::tunnel::upstream::Forwarding;
 use stunnel::{
     config::{self, QuicBackend, ServerConfig},
-    print_version, quic, tlstcp,
+    metrics::TransportConnection,
+    print_version, quic,
+    telemetry::Telemetry,
+    tlstcp,
     tunnel::server::handle_routed_tunnels,
+    version,
 };
 
 async fn quinn_server(config: ServerConfig, route: Forwarding) -> std::io::Result<()> {
@@ -27,6 +31,7 @@ async fn quinn_server(config: ServerConfig, route: Forwarding) -> std::io::Resul
         let route = route.clone();
         tasks.spawn(async move {
             if let Ok(conn) = incoming.await {
+                let _connection = TransportConnection::established("quic");
                 handle_quinn_conn(conn, route)
                     .await
                     .inspect_err(|error| {
@@ -60,6 +65,7 @@ async fn s2n_server(config: ServerConfig, route: Forwarding) -> std::io::Result<
 
         let route = route.clone();
         tasks.spawn(async move {
+            let _connection = TransportConnection::established("s2n-quic");
             handle_s2n_conn(conn, route)
                 .await
                 .inspect_err(|error| {
@@ -110,6 +116,14 @@ async fn main() {
         Ok(config) => config,
         Err(error) => {
             eprintln!("failed to load server config: {error}");
+            return;
+        }
+    };
+
+    let _telemetry = match Telemetry::init(&config.otel, &version("stunnel_server")) {
+        Ok(telemetry) => telemetry,
+        Err(error) => {
+            eprintln!("failed to start metrics: {error}");
             return;
         }
     };

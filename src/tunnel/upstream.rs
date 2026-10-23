@@ -1,6 +1,7 @@
 use super::{OpenTunnel, Tunnel};
 use crate::{
     config::{PeerConfig, TunnelType},
+    metrics::TransportConnection,
     quic, tlstcp,
 };
 use std::{
@@ -155,12 +156,11 @@ impl PeerTransport {
             #[cfg(test)]
             Transport::Test(open) => open().await,
             Transport::Tls(connector) => Ok(relay_stream(
-                connector
-                    .clone()
-                    .open_tunnel()
-                    .await
-                    .map_err(OpenError::tls)?,
-                None,
+                connector.clone().open_tunnel().await.map_err(|error| {
+                    TransportConnection::failed("tlstcp");
+                    OpenError::tls(error)
+                })?,
+                Some(Box::new(TransportConnection::established("tlstcp"))),
             )),
             Transport::AnyTls(connector) => Ok(relay_stream(
                 connector
@@ -183,11 +183,19 @@ impl PeerTransport {
                     {
                         let connection = endpoint
                             .connect(peer.server_addr, &peer.server_name)
-                            .map_err(io::Error::other)?
+                            .map_err(|error| {
+                                TransportConnection::failed("quic");
+                                io::Error::other(error)
+                            })?
                             .await
-                            .map_err(OpenError::quinn)?;
+                            .map_err(|error| {
+                                TransportConnection::failed("quic");
+                                OpenError::quinn(error)
+                            })?;
+                        let metrics = TransportConnection::established("quic");
                         let reject = connection.clone();
                         let task = tokio::spawn(async move {
+                            let _connection = metrics;
                             loop {
                                 tokio::select! {
                                     stream = reject.accept_bi() => { if stream.is_err() { break; } }
@@ -224,13 +232,17 @@ impl PeerTransport {
                     {
                         let connect = s2n_quic::client::Connect::new(peer.server_addr)
                             .with_server_name(peer.server_name.clone());
-                        let mut connection =
-                            endpoint.connect(connect).await.map_err(OpenError::s2n)?;
+                        let mut connection = endpoint.connect(connect).await.map_err(|error| {
+                            TransportConnection::failed("s2n-quic");
+                            OpenError::s2n(error)
+                        })?;
+                        let metrics = TransportConnection::established("s2n-quic");
                         connection.keep_alive(true).map_err(io::Error::other)?;
                         let (connection, mut acceptor) = connection.split();
                         let closed = Arc::new(AtomicBool::new(false));
                         let ended = closed.clone();
                         let task = tokio::spawn(async move {
+                            let _connection = metrics;
                             while let Ok(Some(_stream)) = acceptor.accept().await {}
                             ended.store(true, Ordering::Release);
                         });
